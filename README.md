@@ -23,7 +23,7 @@ coverage of every optional LSP feature or generated protocol type.
 | Feature helpers | `DocumentPosition`, `Location`, `Diagnostic`, `publish_diagnostics`, `hover`, `progress` |
 | Standard I/O | `Stdio::new`, `read_body`, `write` |
 
-`../consumers/lsp` is a runnable server with hover, typed addition, echo and
+`../../goml-dev/ecosystem/consumers/lsp` is a runnable server with hover, typed addition, echo and
 document-inspection handlers. Its black-box tests also instantiate public APIs
 across a normally resolved versioned dependency.
 
