@@ -23,7 +23,7 @@ coverage of every optional LSP feature or generated protocol type.
 | Feature helpers | `DocumentPosition`, `Location`, `Diagnostic`, `publish_diagnostics`, `hover`, `progress` |
 | Standard I/O | `Stdio::new`, `read_body`, `write` |
 
-`../../goml-dev/ecosystem/consumers/lsp` is a runnable server with hover, typed addition, echo and
+`consumer` is a runnable server with hover, typed addition, echo and
 document-inspection handlers. Its black-box tests also instantiate public APIs
 across a normally resolved versioned dependency.
 
@@ -236,10 +236,10 @@ the application. Raw JSON handlers support their protocol messages.
 
 ## Validation
 
-Run from the repository root:
+Run from this library repository:
 
 ```sh
-just ecosystem-test lsp
+(cd ../verification && just ecosystem-test lsp)
 ```
 
 The GoML tests cover every two-part split of a Unicode frame, single-byte chunks,

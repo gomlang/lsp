@@ -15,9 +15,13 @@ fn stdio_binary() -> string {
     if let Ok(binary) = env::var_structured("GOML_VERIFY_BINARY") {
         return binary;
     }
-    let driver = env::var_structured("GOML_VERIFY_DRIVER").unwrap_or(
-        testing::expect_ok(fs::canonicalize("../../../stage2/bin/goml"), "driver"),
-    );
+    let driver = match env::var_structured("GOML_VERIFY_DRIVER") {
+        Ok(value) => value,
+        Err(_) => testing::expect_ok(
+            fs::canonicalize("../../../goml-dev/stage2/bin/goml"),
+            "driver",
+        ),
+    };
     let built = testing::expect_ok(
         process::Command::new(driver).args(
             Vec::from_array(["build", "--target-dir", "_artifact/stdio-reference"]),
