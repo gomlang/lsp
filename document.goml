@@ -298,6 +298,16 @@ impl Document {
     }
 
     pub fn apply_edits(self: Document, edits: Vec[TextEdit]) -> Result[string, RpcError] {
+        self.apply_edits_with_limit(edits, 9223372036854775807)
+    }
+
+    pub fn apply_edits_with_limit(self: Document, edits: Vec[TextEdit], max_bytes: isize) -> Result[
+        string,
+        RpcError,
+    ] {
+        if max_bytes < 0 {
+            return Result::Err(invalid("invalid edit output limit"))
+        }
         let spans: Vec[(isize, isize, isize, string)] = Vec::new();
         for index in 0..edits.len() {
             let edit = edits[index];
@@ -311,12 +321,28 @@ impl Document {
                 left.0 - right.0
             },
         );
-        let output = text::StringBuilder::new();
-        let mut cursor: isize = 0;
-        for (start, end, _, replacement) in spans {
+        let mut cursor = 0;
+        let mut removed = 0;
+        for (start, end, _, _) in spans {
             if start < cursor {
                 return Result::Err(invalid("overlapping text edits"))
             }
+            removed += end - start;
+            cursor = end;
+        }
+        let mut size = self.text_value.len_bytes() - removed;
+        if size > max_bytes {
+            return Result::Err(invalid("edit output size limit exceeded"))
+        }
+        for (_, _, _, replacement) in spans {
+            if replacement.byte_len() > max_bytes - size {
+                return Result::Err(invalid("edit output size limit exceeded"))
+            }
+            size += replacement.byte_len();
+        }
+        let output = text::StringBuilder::new();
+        cursor = 0;
+        for (start, end, _, replacement) in spans {
             let unchanged = self.text_value.slice_bytes(cursor, start).map_err(
                 |error| invalid(error.to_string()),
             )?;

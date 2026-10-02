@@ -104,6 +104,13 @@ which differ from sequential didChange events. It validates every range, sorts
 by original position, rejects overlap, and preserves insertion order for edits
 at the same position. Inserts can precede one replacement at that position.
 The result is returned as a string without changing the snapshot.
+`apply_edits_with_limit(edits, max_bytes)` additionally bounds the final UTF-8 byte
+length. Every coordinate and overlap is checked before size accounting, preserving
+range diagnostics even when an earlier replacement would exceed the budget. The
+exact final length is measured before output construction; deletions anywhere in
+the batch reduce the retained length. Negative limits fail, and an empty batch
+still checks the snapshot size. The original `apply_edits` retains its unrestricted
+output behavior with the same complete preflight validation.
 
 ## Requests and dispatch
 
