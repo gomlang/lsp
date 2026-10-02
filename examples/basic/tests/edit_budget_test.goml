@@ -1,0 +1,24 @@
+package tests;
+
+use ecosystem::lsp;
+use std::testing;
+
+#[test]
+fn downstream_bounded_workspace_edits_use_snapshot_encoding() -> () {
+    let doc = testing::expect_ok(
+        lsp::Document::new_with_encoding("file:///a", "text", 1, "😀!", lsp::PositionEncoding::Utf8),
+        "document",
+    );
+    let edit = lsp::TextEdit {
+        range: lsp::Range {
+            start: lsp::Position { line: 0, character: 0 },
+            end: lsp::Position { line: 0, character: 4 },
+        },
+        new_text: "界",
+    };
+    testing::assert_eq(
+        testing::expect_ok(doc.apply_edits_with_limit(Vec::from_array([edit]), 4), "edit"),
+        "界!",
+    );
+    testing::assert_err(doc.apply_edits_with_limit(Vec::from_array([edit]), 3));
+}
