@@ -1,0 +1,16 @@
+package tests;
+
+use ecosystem::lsp;
+use std::testing;
+
+#[test]
+fn downstream_framing_accepts_quoted_extension_parameters() -> () {
+    let stream = testing::expect_ok(lsp::FrameDecoder::new(lsp::FrameLimits::standard()), "decoder");
+    let frame = "Content-Type: application/vscode-jsonrpc; profile=\"a;b\"; charset=\"utf-8\"\r\nContent-Length: 2\r\n\r\n{}".to_bytes();
+    testing::assert_ok(stream.push(frame.as_slice()));
+    testing::assert_eq(
+        testing::expect_some(testing::expect_ok(stream.next(), "frame"), "body"),
+        "{}",
+    );
+    testing::assert_ok(stream.finish());
+}

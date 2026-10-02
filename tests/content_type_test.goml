@@ -1,0 +1,56 @@
+package tests;
+
+use ecosystem::lsp;
+use std::testing;
+
+#[test]
+fn quoted_content_parameters_preserve_semicolons_and_escaped_characters() -> () {
+    for content_type in[
+        "application/vscode-jsonrpc; profile=\"a;b=c\"; charset=\"utf-8\"",
+        "x; profile=\"escaped\\\";still quoted\"; charset=utf8",
+        "x; charset=\"u\\tf-8\"; profile=\"\"",
+        "x; profile=\"charset=utf-16; charset=utf8\"; charset=UTF-8",
+    ] {
+        let wire = ("Content-Length: 2\r\nContent-Type: " + content_type + "\r\n\r\n{}").to_bytes();
+        for split in 0..wire.len() + 1 {
+            let stream = decoder();
+            testing::assert_ok(stream.push(wire.slice(0, split)));
+            let first = testing::expect_ok(stream.next(), "first part");
+            testing::assert_ok(stream.push(wire.slice(split, wire.len())));
+            let body = if let Some(body) = first {
+                body
+            } else {
+                testing::expect_some(testing::expect_ok(stream.next(), "second part"), "body")
+            };
+            testing::assert_eq(body, "{}");
+            testing::assert_ok(stream.finish());
+        }
+    }
+}
+
+#[test]
+fn malformed_parameters_poison_until_reset() -> () {
+    for value in[
+        "x; profile=\"unterminated",
+        "x; profile=\"a\"tail",
+        "x; profile=",
+        "x; bad name=value",
+        "x; profile=two words",
+        "x; profile=\"trailing\\",
+        "x; charset=\"utf-8; charset=utf8\"",
+        "x; charset=\"u\\tf-8\"; charset=utf8",
+    ] {
+        let stream = decoder();
+        let wire = ("Content-Length: 0\r\nContent-Type: " + value + "\r\n\r\n").to_bytes();
+        testing::assert_ok(stream.push(wire.as_slice()));
+        testing::assert_err(stream.next());
+        testing::assert_err(stream.finish());
+        testing::assert_err(stream.push(lsp::frame_body("{}").as_slice()));
+        stream.reset();
+        testing::assert_ok(stream.push(lsp::frame_body("{}").as_slice()));
+        testing::assert_eq(
+            testing::expect_some(testing::expect_ok(stream.next(), "reset"), "body"),
+            "{}",
+        );
+    }
+}
