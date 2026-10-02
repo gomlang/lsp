@@ -23,9 +23,9 @@ coverage of every optional LSP feature or generated protocol type.
 | Feature helpers | `DocumentPosition`, `Location`, `Diagnostic`, `publish_diagnostics`, `hover`, `progress` |
 | Standard I/O | `Stdio::new`, `read_body`, `write` |
 
-`consumer` is a runnable server with hover, typed addition, echo and
-document-inspection handlers. Its black-box tests also instantiate public APIs
-across a normally resolved versioned dependency.
+`examples/basic/` is a runnable server with hover, typed addition, echo and
+document-inspection handlers. Its black-box tests instantiate public APIs;
+`goml verify` also runs them against an isolated registry snapshot.
 
 ## Framing and messages
 
@@ -172,7 +172,7 @@ override these built-in handlers.
 
 `Event` returns a reply, a correlated client response or an exit code.
 Notification/transport failures are returned to the application for local
-diagnostics; they are not sent as unsolicited responses. The consumer demonstrates
+diagnostics; they are not sent as unsolicited responses. The example demonstrates
 parse-error responses with null IDs and continuing after a malformed JSON body.
 
 ### Deferred work and deadlines
@@ -206,7 +206,7 @@ rejected, including after an ID is reused. `complete` and `execute` also check
 deadlines, so an overdue result cannot bypass a delayed timer poll. No timer or
 worker goroutine is created. The application must arrange a timer wakeup even when
 no input arrives; polling only after reading messages cannot enforce prompt idle
-timeouts. The stdio consumer uses an explicit `test/poll` notification for its
+timeouts. The stdio example uses an explicit `test/poll` notification for its
 protocol deadline fixtures. Built-in immediate methods do not receive deadlines.
 
 Shutdown stops accepting ordinary work while allowing already accepted requests
@@ -246,12 +246,12 @@ The GoML tests cover every two-part split of a Unicode frame, single-byte chunks
 multiple frames, limits, truncated input, malformed headers, reset, malformed
 JSON, integer overflow, all message variants and request lifecycle. Document
 tests cover transactional rollback, original-coordinate edits and snapshots.
-A consumer test independently counts scalar byte/UTF-16/UTF-32 boundaries across
+An example test independently counts scalar byte/UTF-16/UTF-32 boundaries across
 300 generated multilingual documents, checking invalid boundaries and clamped
 positions. Deferred dispatch, outgoing deadlines, cancellation and duplicate
 suppression have direct native tests.
 
-Native GoML tests start the real stdio consumer and independently decode
+Native GoML tests start the real stdio example and independently decode
 Content-Length/CRLF frames, JSON-RPC versions and response envelopes. They retain
 102 correlated bulk replies and four failure exits. Bidirectional pipe sessions
 exercise fragmented requests, protocol errors, initialization and shutdown,
@@ -262,3 +262,15 @@ polling, cancellation, duplicate replies and cleanup with an outstanding request
 Pipe reads, writes and process cleanup have deadlines; stderr must match the
 deliberately triggered diagnostics exactly, and successful exit permits no extra
 stdout. This is targeted protocol coverage, not full LSP certification.
+
+## Development and examples
+
+Requires GoML 0.1.55 or newer. The `examples/basic/` example shares the root manifest. From the library root, run:
+
+```sh
+goml run --example basic
+goml test
+goml verify --timeout 300s
+```
+
+`goml test` builds the example and runs its tests. `goml verify` repeats the example checks as an independent module against an isolated registry snapshot. `(cd ../verification && just ecosystem-test lsp)` also retains the library-specific smoke and compatibility checks.

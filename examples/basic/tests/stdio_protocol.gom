@@ -17,21 +17,20 @@ fn stdio_binary() -> string {
     }
     let driver = match env::var_structured("GOML_VERIFY_DRIVER") {
         Ok(value) => value,
-        Err(_) => testing::expect_ok(
-            fs::canonicalize("../../../goml-dev/stage2/bin/goml"),
-            "driver",
-        ),
+        Err(_) => testing::expect_ok(fs::canonicalize("../../goml-dev/stage2/bin/goml"), "driver"),
     };
     let built = testing::expect_ok(
         process::Command::new(driver).args(
-            Vec::from_array(["build", "--target-dir", "_artifact/stdio-reference"]),
+            Vec::from_array(
+                ["build", "--example", "basic", "--target-dir", "_artifact/stdio-reference"],
+            ),
         ).output_timeout_structured(time::Duration::from_seconds(90)),
         "build stdio consumer",
     );
     if !built.status().success() {
         testing::fail(testing::expect_ok(built.stderr().to_string_utf8(), "build stderr"));
     }
-    "_artifact/stdio-reference/bin/lsp"
+    "_artifact/stdio-reference/bin/examples/basic/basic"
 }
 
 fn wire_field(value: json::Value, name: string) -> json::Value {

@@ -1,6 +1,6 @@
 package tests;
 
-use consumer::lsp as app;
+use ecosystem::lsp::examples::basic as app;
 use ecosystem::lsp;
 use std::json;
 use std::testing;
