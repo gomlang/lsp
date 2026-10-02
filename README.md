@@ -39,8 +39,13 @@ consumed buffer prefixes are compacted when needed.
 16 KiB of buffered input. Limits are configurable and validated. Header parsing
 checks ASCII, field names, decimal byte lengths, duplicate length/type/charset
 fields and UTF-8 charset declarations, including `utf8` and quoted values.
-Header names are case insensitive. Unknown headers and non-charset content-type
-parameters are ignored. Media type names themselves are not restricted.
+Header names are case insensitive. Content-type parameters accept token and quoted
+values, including semicolons and backslash-escaped characters inside quotes, under
+[RFC 9110 parameter syntax](https://www.rfc-editor.org/rfc/rfc9110.html#section-5.6.6).
+Malformed names, missing values, unterminated quotes and trailing quoted-value text
+are rejected. Charset comparison uses the decoded value; quoted text cannot hide
+a duplicate charset. Unknown headers and valid non-charset content-type parameters
+are ignored. Media type names themselves are not restricted.
 
 Malformed framing poisons the decoder until `reset`; it never guesses a new
 frame boundary. `finish` succeeds only after all complete frames have been drained

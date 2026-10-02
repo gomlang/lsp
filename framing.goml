@@ -21,6 +21,96 @@ pub struct FrameDecoder {
     failure: Ref[Option[string]],
 }
 
+fn parameter_token(value: byte) -> bool {
+    (value >= b'a' && value <= b'z') || (value >= b'A' && value <= b'Z')
+        || (value >= b'0' && value <= b'9')
+        || "!#$%&'*+-.^_`|~".to_bytes().contains(value)
+}
+
+fn parameter_value(value: string) -> Result[string, string] {
+    if value == "" {
+        return Result::Err("empty content type parameter")
+    }
+    if !value.starts_with("\"") {
+        for byte in value.to_bytes() {
+            if !parameter_token(byte) {
+                return Result::Err("invalid content type parameter value")
+            }
+        }
+        return Result::Ok(value)
+    }
+    let decoded: Vec[byte] = Vec::new();
+    let mut index = 1;
+    while index < value.byte_len() {
+        let byte = value.byte_get(index);
+        if byte == b'"' {
+            if index + 1 != value.byte_len() {
+                return Result::Err("trailing content type parameter text")
+            }
+            return Result::Ok(string_from_utf8(decoded).1)
+        }
+        if byte == b'\\' {
+            index += 1;
+            if index == value.byte_len() {
+                return Result::Err("unterminated content type escape")
+            }
+        }
+        decoded.push(value.byte_get(index));
+        index += 1;
+    }
+    Result::Err("unterminated content type quote")
+}
+
+fn content_parameters(value: string) -> Result[Vec[(string, string)], string] {
+    let result: Vec[(string, string)] = Vec::new();
+    let mut start = 0;
+    let mut quoted = false;
+    let mut escaped = false;
+    let mut media = true;
+    for index in 0..value.byte_len() + 1 {
+        if index < value.byte_len() {
+            let byte = value.byte_get(index);
+            if escaped {
+                escaped = false;
+                continue
+            }
+            if quoted && byte == b'\\' {
+                escaped = true;
+                continue
+            }
+            if byte == b'"' {
+                quoted = !quoted;
+                continue
+            }
+            if byte != b';' || quoted {
+                continue
+            }
+        }
+        if quoted || escaped {
+            return Result::Err("unterminated content type quote")
+        }
+        if media {
+            media = false;
+        } else {
+            let (key, raw) = value.byte_slice(start, index).trim().split_once("=").ok_or(
+                "invalid content type parameter",
+            )?;
+            let key = key.trim();
+            if key == "" {
+                return Result::Err("empty content type parameter name")
+            }
+            for byte in key.to_bytes() {
+                if !parameter_token(byte) {
+                    return Result::Err("invalid content type parameter name")
+                }
+            }
+            result.push((key, parameter_value(raw.trim())?));
+        }
+        start = index + 1;
+    }
+    Result::Ok(result)
+}
+
 fn header_length(header: string, maximum: isize) -> Result[isize, string] {
     if !header.is_ascii() {
         return Result::Err("headers must be ASCII")
@@ -68,24 +158,13 @@ fn header_length(header: string, maximum: isize) -> Result[isize, string] {
                 return Result::Err("duplicate Content-Type")
             }
             content_type = true;
-            let parameters = value.split(";");
             let mut charset_seen = false;
-            for index in 1..parameters.len() {
-                let (key, value) = parameters[index].trim().split_once("=").ok_or(
-                    "invalid content type parameter",
-                )?;
-                if key.trim().eq_ignore_ascii_case("charset") {
+            for (key, value) in content_parameters(value)? {
+                if key.eq_ignore_ascii_case("charset") {
                     if charset_seen {
                         return Result::Err("duplicate charset parameter")
                     }
                     charset_seen = true;
-                    let value = value.trim();
-                    let value = if value.byte_len() >= 2 && value.starts_with("\"")
-                        && value.ends_with("\"") {
-                        value.byte_slice(1, value.byte_len() - 1)
-                    } else {
-                        value
-                    };
                     if !value.eq_ignore_ascii_case("utf-8") && !value.eq_ignore_ascii_case("utf8") {
                         return Result::Err("unsupported character encoding")
                     }
