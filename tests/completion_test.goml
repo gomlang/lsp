@@ -1,0 +1,118 @@
+package tests;
+
+use ecosystem::lsp;
+use std::json;
+use std::testing;
+
+fn position(line: isize, character: isize) -> lsp::Position {
+    lsp::Position { line, character }
+}
+
+fn item_with_edit(start: lsp::Position, end: lsp::Position) -> lsp::CompletionItem {
+    lsp::CompletionItem {
+        text_edit: Option::Some(
+            lsp::TextEdit { range: lsp::Range { start, end }, new_text: "next\nline" },
+        ),
+        ..lsp::CompletionItem::new("item"),
+    }
+}
+
+#[test]
+fn completion_serializes_optional_fields_without_losing_empty_false_or_null() -> () {
+    let minimal = testing::expect_ok(lsp::CompletionItem::new("名称😀").to_json(), "minimal");
+    testing::assert_eq(json::encode(minimal), "{\"label\":\"名称😀\"}");
+    let item = lsp::CompletionItem {
+        kind: Option::Some(25),
+        detail: Option::Some(""),
+        documentation: Option::Some("**plain**"),
+        sort_text: Option::Some("01"),
+        filter_text: Option::Some("it"),
+        insert_text: Option::Some("${1:value}"),
+        insert_text_format: Option::Some(2),
+        preselect: Option::Some(false),
+        deprecated: Option::Some(true),
+        data: Option::Some(json::Value::Null),
+        ..item_with_edit(position(1, 2), position(1, 4)),
+    };
+    let value = testing::expect_ok(item.to_json_at(position(1, 3)), "full");
+    for (key, expected) in[
+        ("kind", "25"),
+        ("detail", "\"\""),
+        ("documentation", "\"**plain**\""),
+        ("sortText", "\"01\""),
+        ("filterText", "\"it\""),
+        ("insertTextFormat", "2"),
+        ("preselect", "false"),
+        ("deprecated", "true"),
+        ("data", "null"),
+    ] {
+        testing::assert_eq(
+            json::encode(testing::expect_some(json::field(value, key), "field")),
+            expected,
+        );
+    }
+    testing::assert_eq(
+        json::encode(testing::expect_some(json::field(value, "textEdit"), "edit")),
+        "{\"range\":{\"start\":{\"line\":1,\"character\":2},\"end\":{\"line\":1,\"character\":4}},\"newText\":\"next\\nline\"}",
+    );
+}
+
+#[test]
+fn completion_validates_enum_values_and_single_line_edit_ranges() -> () {
+    for kind in[0, -1, 26, 2147483648] {
+        let item = lsp::CompletionItem { kind: Option::Some(kind), ..lsp::CompletionItem::new("x") };
+        testing::assert_eq(testing::expect_err(item.to_json(), "invalid kind").code, -32602);
+    }
+    for kind in 1..26 {
+        testing::assert_ok(
+            lsp::CompletionItem { kind: Option::Some(kind), ..lsp::CompletionItem::new("x") }.to_json(),
+        );
+    }
+    for format in[-1, 0, 3] {
+        testing::assert_err(
+            lsp::CompletionItem {
+                insert_text_format: Option::Some(format),
+                ..lsp::CompletionItem::new("x"),
+            }.to_json(),
+        );
+    }
+    for (start, end) in[
+        (position(-1, 0), position(0, 0)),
+        (position(0, 2), position(0, 1)),
+        (position(0, 0), position(1, 0)),
+        (position(0, 0), position(0, 2147483648)),
+    ] {
+        testing::assert_err(item_with_edit(start, end).to_json());
+    }
+    let item = item_with_edit(position(1, 2), position(1, 4));
+    for point in[position(1, 2), position(1, 3), position(1, 4)] {
+        testing::assert_ok(item.to_json_at(point));
+    }
+    for point in[position(1, 1), position(1, 5), position(0, 3), position(2, 3), position(-1, 0)] {
+        testing::assert_err(item.to_json_at(point));
+    }
+    testing::assert_ok(item_with_edit(position(0, 0), position(0, 0)).to_json_at(position(0, 0)));
+}
+
+#[test]
+fn lists_preserve_order_and_reject_any_invalid_item() -> () {
+    let empty = lsp::CompletionList { is_incomplete: false, items: Vec::new() };
+    testing::assert_eq(
+        json::encode(testing::expect_ok(empty.to_json(), "empty")),
+        "{\"isIncomplete\":false,\"items\":[]}",
+    );
+    testing::assert_err(empty.to_json_at(position(0, -1)));
+    let items = Vec::from_array(
+        [lsp::CompletionItem::new("second"), lsp::CompletionItem::new("first")],
+    );
+    let list = lsp::CompletionList { is_incomplete: true, items };
+    testing::assert_eq(
+        json::encode(testing::expect_ok(list.to_json_at(position(0, 0)), "list")),
+        "{\"isIncomplete\":true,\"items\":[{\"label\":\"second\"},{\"label\":\"first\"}]}",
+    );
+    testing::assert_eq(items.len(), 2);
+    items.push(item_with_edit(position(2, 0), position(3, 0)));
+    testing::assert_err(list.to_json());
+    testing::assert_err(list.to_json_at(position(0, 0)));
+    testing::assert_eq(items.len(), 3);
+}

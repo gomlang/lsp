@@ -1,0 +1,64 @@
+package tests;
+
+use ecosystem::lsp;
+use std::json;
+use std::testing;
+
+#[test]
+fn downstream_completion_result_roundtrips_through_rpc_and_framing() -> () {
+    let position = lsp::Position { line: 0, character: 2 };
+    let item = lsp::CompletionItem {
+        kind: Option::Some(3),
+        insert_text_format: Option::Some(2),
+        text_edit: Option::Some(
+            lsp::TextEdit {
+                range: lsp::Range { start: lsp::Position { line: 0, character: 0 }, end: position },
+                new_text: "print(${1:value})",
+            },
+        ),
+        ..lsp::CompletionItem::new("print"),
+    };
+    let result = testing::expect_ok(
+        lsp::CompletionList { is_incomplete: true, items: Vec::from_array([item]) }.to_json_at(
+            position,
+        ),
+        "completion",
+    );
+    let message = lsp::Message::Response(Option::Some(lsp::Id::Number(7)), Result::Ok(result));
+    let encoded = testing::expect_ok(lsp::encode(message), "encode");
+    let decoder = testing::expect_ok(
+        lsp::FrameDecoder::new(lsp::FrameLimits::standard()),
+        "decoder",
+    );
+    testing::assert_ok(decoder.push(lsp::frame_body(encoded).as_slice()));
+    let body = testing::expect_some(testing::expect_ok(decoder.next(), "frame"), "body");
+    let decoded = testing::expect_ok(lsp::decode(body), "decode");
+    match decoded {
+        lsp::Message::Response(id, response) => {
+            testing::assert(id == Option::Some(lsp::Id::Number(7)));
+            let output = testing::expect_ok(response, "result");
+            testing::assert_eq(json::encode(output), json::encode(result));
+            testing::assert(
+                json::as_bool(testing::expect_some(json::field(output, "isIncomplete"), "flag"))
+                    == Option::Some(true),
+            );
+        },
+        _ => testing::fail("completion response"),
+    }
+    testing::assert_ok(decoder.finish());
+    let document = testing::expect_ok(
+        lsp::Document::new("file:///demo", "goml", 1, "pr"),
+        "document",
+    );
+    let plain = lsp::TextEdit {
+        range: lsp::Range { start: lsp::Position { line: 0, character: 0 }, end: position },
+        new_text: "print",
+    };
+    testing::assert_eq(
+        testing::expect_ok(
+            document.apply_edits(Vec::from_array([plain])),
+            "consumer applies plain edit",
+        ),
+        "print",
+    );
+}

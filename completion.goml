@@ -1,0 +1,124 @@
+package lsp;
+
+use std::json;
+
+pub struct CompletionItem {
+    pub label: string,
+    pub kind: Option[isize],
+    pub detail: Option[string],
+    pub documentation: Option[string],
+    pub sort_text: Option[string],
+    pub filter_text: Option[string],
+    pub insert_text: Option[string],
+    pub insert_text_format: Option[isize],
+    pub text_edit: Option[TextEdit],
+    pub preselect: Option[bool],
+    pub deprecated: Option[bool],
+    pub data: Option[json::Value],
+}
+
+impl CompletionItem {
+    pub fn new(label: string) -> CompletionItem {
+        CompletionItem {
+            label,
+            kind: Option::None,
+            detail: Option::None,
+            documentation: Option::None,
+            sort_text: Option::None,
+            filter_text: Option::None,
+            insert_text: Option::None,
+            insert_text_format: Option::None,
+            text_edit: Option::None,
+            preselect: Option::None,
+            deprecated: Option::None,
+            data: Option::None,
+        }
+    }
+
+    pub fn to_json(self: CompletionItem) -> Result[json::Value, RpcError] {
+        let fields = Vec::from_array([("label", json::Value::String(self.label))]);
+        if let Some(kind) = self.kind {
+            if kind < 1 || kind > 25 {
+                return Result::Err(invalid("completion kind must be 1 through 25"))
+            }
+            fields.push(("kind", json::Value::Number(kind.to_string())));
+        }
+        for (key, value) in[
+            ("detail", self.detail),
+            ("documentation", self.documentation),
+            ("sortText", self.sort_text),
+            ("filterText", self.filter_text),
+            ("insertText", self.insert_text),
+        ] {
+            if let Some(value) = value {
+                fields.push((key, json::Value::String(value)));
+            }
+        }
+        if let Some(format) = self.insert_text_format {
+            if format != 1 && format != 2 {
+                return Result::Err(invalid("completion insert-text format must be 1 or 2"))
+            }
+            fields.push(("insertTextFormat", json::Value::Number(format.to_string())));
+        }
+        if let Some(edit) = self.text_edit {
+            let _ = Range::from_json(edit.range.to_json())?;
+            if edit.range.start.line != edit.range.end.line {
+                return Result::Err(invalid("completion edit must have a single-line range"))
+            }
+            fields.push(("textEdit", edit.to_json()));
+        }
+        if let Some(value) = self.preselect {
+            fields.push(("preselect", json::Value::Bool(value)));
+        }
+        if let Some(value) = self.deprecated {
+            fields.push(("deprecated", json::Value::Bool(value)));
+        }
+        if let Some(value) = self.data {
+            fields.push(("data", value));
+        }
+        Result::Ok(json::object(fields))
+    }
+
+    pub fn to_json_at(self: CompletionItem, position: Position) -> Result[json::Value, RpcError] {
+        let _ = Position::from_json(position.to_json())?;
+        let value = self.to_json()?;
+        if let Some(edit) = self.text_edit {
+            if before(position, edit.range.start) || before(edit.range.end, position) {
+                return Result::Err(invalid("completion edit must contain the request position"))
+            }
+        }
+        Result::Ok(value)
+    }
+}
+
+pub struct CompletionList {
+    pub is_incomplete: bool,
+    pub items: Vec[CompletionItem],
+}
+
+impl CompletionList {
+    pub fn to_json(self: CompletionList) -> Result[json::Value, RpcError] {
+        let items = Vec::new();
+        for item in self.items {
+            items.push(item.to_json()?);
+        }
+        Result::Ok(completion_list_value(self.is_incomplete, items))
+    }
+
+    pub fn to_json_at(self: CompletionList, position: Position) -> Result[json::Value, RpcError] {
+        let _ = Position::from_json(position.to_json())?;
+        let items = Vec::new();
+        for item in self.items {
+            items.push(item.to_json_at(position)?);
+        }
+        Result::Ok(completion_list_value(self.is_incomplete, items))
+    }
+}
+
+fn completion_list_value(incomplete: bool, items: Vec[json::Value]) -> json::Value {
+    json::object(
+        Vec::from_array(
+            [("isIncomplete", json::Value::Bool(incomplete)), ("items", json::Value::Array(items))],
+        ),
+    )
+}

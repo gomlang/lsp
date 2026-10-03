@@ -20,7 +20,7 @@ coverage of every optional LSP feature or generated protocol type.
 | Documents | `PositionEncoding`, `Position`, `Range`, `TextEdit`, `Change`, `Document`, `Documents`, `utf16_length` |
 | Requests | `Session`, `RequestToken`, `Completed`, `ExpiredRequest` |
 | Dispatch | `RequestContext`, `Router`, `Server`, `Phase`, `Event`, `Dispatch`, `PendingRequest` |
-| Feature helpers | `DocumentPosition`, `Location`, `Diagnostic`, `publish_diagnostics`, `hover`, `progress` |
+| Feature helpers | `DocumentPosition`, `Location`, `Diagnostic`, `publish_diagnostics`, `hover`, `progress`, `CompletionItem`, `CompletionList` |
 | Standard I/O | `Stdio::new`, `read_body`, `write` |
 
 `examples/basic/` is a runnable server with hover, typed addition, echo and
@@ -111,6 +111,31 @@ exact final length is measured before output construction; deletions anywhere in
 the batch reduce the retained length. Negative limits fail, and an empty batch
 still checks the snapshot size. The original `apply_edits` retains its unrestricted
 output behavior with the same complete preflight validation.
+
+## Completion output
+
+`CompletionItem::new(label)` starts a completion with only its required label.
+Optional fields cover kind (LSP values 1–25), detail, plain-text documentation,
+sort/filter text, insertion text, insertion format (1 = plain text, 2 = snippet),
+a `TextEdit`, preselection, deprecation and opaque data. `to_json()` omits absent
+fields, preserves explicit false/empty/null values, and validates kind, format
+and edit coordinates. Completion edit ranges must be ordered and single-line;
+their replacement text can contain newlines. A supplied `text_edit` takes
+precedence over `insert_text` under the protocol.
+
+Use `to_json_at(request.position)` to also validate that the edit range contains
+the completion request position (including either endpoint). `CompletionList`
+contains `is_incomplete` and ordered `items`; its corresponding conversion methods
+validate all items. These helpers return JSON suitable for a raw router result.
+They neither mutate the supplied item vector nor execute edits.
+
+Applications select supported kinds, snippets and optional fields according to
+client capabilities. Coordinate validity against the actual document, snippet
+syntax and language-specific completion computation remain application concerns.
+Insert/replace edits, additional edits, commands, markup documentation and item
+defaults still use application-defined JSON. Opaque data follows the existing raw
+JSON contract: valid numeric lexemes and no reference cycles. These helpers target
+[LSP 3.17 completion items](https://microsoft.github.io/language-server-protocol/specifications/lsp/3.17/specification/#completionItem).
 
 ## Requests and dispatch
 
