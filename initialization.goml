@@ -335,9 +335,10 @@ impl Server {
         let result = match self.initialize_handler.get() {
             Some(handler) => {
                 self.initializing.set(true);
-                let result = handler(params.snapshot(), encoding);
-                self.initializing.set(false);
-                result.map_err(|problem| initialization_error(problem))?
+                defer self.initializing.set(false);
+                handler(params.snapshot(), encoding).map_err(
+                    |problem| initialization_error(problem),
+                )?
             },
             None => InitializeResult::new(self.capabilities),
         };

@@ -292,6 +292,11 @@ Without a callback, the constructor's capabilities retain their existing behavio
 The library still supplies `positionEncoding` and `textDocumentSync`; either field
 in application-provided capabilities is rejected.
 
+An initialization callback panic propagates after releasing the dispatch guard and
+pending request slot. No response is synthesized. The phase, negotiated encoding
+and initialization snapshot remain unchanged, allowing an application that catches
+the panic to retry initialization.
+
 ```goml
 server.on_initialize(|params, encoding| {
     let _ = encoding;
@@ -341,6 +346,10 @@ cancellation and `params()` exposes the request parameters. Document snapshots
 should be captured before scheduling work when it needs a fixed source version.
 `execute` checks cancellation before invoking a handler; `complete` permits a
 successful partial result after client cancellation, as the protocol allows.
+If a handler panics during `execute`, the caller retains its active pending request
+and can catch the panic and complete it with an error. Synchronous `handle` instead
+releases its internally owned request slot before propagating a handler panic;
+it does not synthesize a response.
 
 `accept_with_timeout(message, Some(duration))` adds a total deadline for deferred
 work. `next_timeout()` gives the shortest remaining duration across incoming and

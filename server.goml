@@ -221,7 +221,10 @@ impl Server {
         match message {
             Message::Request(id, method, params) => {
                 let reply = match self.session_value.begin(id, method) {
-                    Ok(token) => self.session_value.complete(token, self.invoke(token, params))?,
+                    Ok(token) => {
+                        defer self.session_value.abandon_incoming(token);
+                        self.session_value.complete(token, self.invoke(token, params))?
+                    },
                     Err(problem) => Message::Response(Option::Some(id), Result::Err(problem)),
                 };
                 Result::Ok(

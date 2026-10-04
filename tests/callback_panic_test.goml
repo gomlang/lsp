@@ -1,0 +1,122 @@
+package tests;
+
+use ecosystem::lsp;
+use std::json;
+use std::panic;
+use std::testing;
+
+#[test]
+fn initialization_callback_panics_release_guard_and_pending_request() -> () {
+    let server = testing::expect_ok(
+        lsp::Server::new(
+            lsp::Router::new(),
+            testing::expect_ok(lsp::Documents::new(1, 128), "documents"),
+            1,
+            json::object(Vec::new()),
+        ),
+        "server",
+    );
+    let armed = Ref::new(true);
+    testing::assert_ok(
+        server.on_initialize(
+            |_, _| {
+                if armed.get() {
+                    panic::raise("initialize callback panic");
+                }
+                Result::Ok(lsp::InitializeResult::new(json::object(Vec::new())))
+            },
+        ),
+    );
+    let params = testing::expect_ok(
+        json::parse("{\"capabilities\":{\"general\":{\"positionEncodings\":[\"utf-8\"]}}}"),
+        "params",
+    );
+    for _ in 0..3 {
+        let caught = testing::expect_err(
+            panic::catch(|| request(server, "initialize", Option::Some(params))),
+            "callback panic",
+        );
+        testing::assert_eq(caught.message(), "initialize callback panic");
+        testing::assert_eq(server.phase(), lsp::Phase::New);
+        testing::assert_eq(server.position_encoding(), lsp::PositionEncoding::Utf16);
+        testing::assert_none(server.initialization());
+        testing::assert_eq(server.session().incoming_count(), 0);
+    }
+    armed.set(false);
+    testing::assert_ok(request(server, "initialize", Option::Some(params)));
+    testing::assert_eq(server.phase(), lsp::Phase::AwaitInitialized);
+    testing::assert_eq(server.position_encoding(), lsp::PositionEncoding::Utf8);
+    testing::assert_eq(server.session().incoming_count(), 0);
+}
+
+fn panic_handler_server(armed: Ref[bool]) -> lsp::Server {
+    let router = lsp::Router::new();
+    testing::assert_ok(
+        router.on_raw_request(
+            "work",
+            |_, _| {
+                if armed.get() {
+                    panic::raise("ordinary callback panic");
+                }
+                Result::Ok(json::Value::Null)
+            },
+        ),
+    );
+    let server = testing::expect_ok(
+        lsp::Server::new(
+            router,
+            testing::expect_ok(lsp::Documents::new(1, 128), "documents"),
+            1,
+            json::object(Vec::new()),
+        ),
+        "server",
+    );
+    testing::assert_ok(
+        request(
+            server,
+            "initialize",
+            Option::Some(
+                json::object(Vec::from_array([("capabilities", json::object(Vec::new()))])),
+            ),
+        ),
+    );
+    testing::assert_ok(server.handle(lsp::Message::Notification("initialized", Option::None)));
+    server
+}
+
+#[test]
+fn ordinary_callback_panics_release_synchronously_owned_requests() -> () {
+    let armed = Ref::new(true);
+    let server = panic_handler_server(armed);
+    for _ in 0..3 {
+        let caught = testing::expect_err(panic::catch(|| server.handle(work_message(7))), "panic");
+        testing::assert_eq(caught.message(), "ordinary callback panic");
+        testing::assert_eq(server.session().incoming_count(), 0);
+    }
+    armed.set(false);
+    let event = testing::expect_ok(server.handle(work_message(7)), "retry");
+    testing::assert_ok(response_result(testing::expect_some(event.reply, "reply")));
+}
+
+#[test]
+fn deferred_callback_panics_preserve_the_callers_pending_request() -> () {
+    let server = panic_handler_server(Ref::new(true));
+    let pending = testing::expect_some(
+        testing::expect_ok(server.accept(work_message(7)), "accept").request,
+        "pending",
+    );
+    let caught = testing::expect_err(panic::catch(|| server.execute(pending)), "panic");
+    testing::assert_eq(caught.message(), "ordinary callback panic");
+    testing::assert(pending.token().is_active());
+    testing::assert_eq(server.session().incoming_count(), 1);
+    let response = testing::expect_ok(
+        server.complete(pending, Result::Err(lsp::RpcError::new(-32603, "handler failed"))),
+        "complete recovered request",
+    );
+    testing::assert_eq(
+        testing::expect_err(response_result(response), "handler failure").code,
+        -32603,
+    );
+    testing::assert_eq(server.session().incoming_count(), 0);
+    testing::assert(!pending.token().is_active());
+}

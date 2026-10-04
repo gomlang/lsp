@@ -1,0 +1,32 @@
+package tests;
+
+use ecosystem::lsp;
+use std::json;
+use std::panic;
+use std::testing;
+
+#[test]
+fn downstream_initialization_can_retry_after_a_caught_callback_panic() -> () {
+    let server = init_consumer_server();
+    let armed = Ref::new(true);
+    testing::assert_ok(
+        server.on_initialize(
+            |_, _| {
+                if armed.get() {
+                    panic::raise("consumer initialize panic");
+                }
+                Result::Ok(lsp::InitializeResult::new(json::object(Vec::new())))
+            },
+        ),
+    );
+    let params = init_consumer_json("{\"capabilities\":{}}");
+    let caught = testing::expect_err(
+        panic::catch(|| init_consumer_request(server, params)),
+        "callback panic",
+    );
+    testing::assert_eq(caught.message(), "consumer initialize panic");
+    testing::assert_eq(server.session().incoming_count(), 0);
+    armed.set(false);
+    testing::assert_ok(init_consumer_request(server, params));
+    testing::assert_eq(server.phase(), lsp::Phase::AwaitInitialized);
+}

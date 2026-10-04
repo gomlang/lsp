@@ -146,6 +146,13 @@ impl Session {
         Result::Ok(())
     }
 
+    fn abandon_incoming(self: Session, token: RequestToken) -> () {
+        if token.active.get() && self.validate_incoming(token).is_ok() {
+            let _ = self.incoming.remove(token.id_value);
+            token.active.set(false);
+        }
+    }
+
     pub fn complete(self: Session, token: RequestToken, result: Result[json::Value, RpcError]) -> Result[
         Message,
         RpcError,
