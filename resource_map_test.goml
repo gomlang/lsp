@@ -1,0 +1,197 @@
+package lsp;
+
+use std::json;
+use std::testing;
+use std::time;
+
+#[test]
+fn resource_map_rebuilds_history_and_preserves_shared_handles() -> () {
+    let resources: ResourceMap[string, Ref[isize]] = ResourceMap::new();
+    let alias = resources;
+    let value = Ref::new(7);
+    resources.set("keeper", value);
+    let original = resources.values.get();
+    let mut rebuilds = 0;
+    for index in 0..4096 {
+        let key = "entry/" + index.to_string();
+        alias.set(key, Ref::new(index));
+        let before = resources.slots.get();
+        testing::assert_some(resources.remove_value(key));
+        if resources.slots.get() < before {
+            rebuilds += 1;
+        }
+        testing::assert(resources.slots.get() <= 18);
+        testing::assert_eq(alias.len(), 1);
+    }
+    testing::assert(rebuilds > 100);
+    testing::assert(ptr_eq(testing::expect_some(alias.get("keeper"), "keeper"), value));
+    for index in 0..1024 {
+        alias.set("keeper", Ref::new(index));
+    }
+    testing::assert(resources.slots.get() <= 18);
+    resources.set("after-rebuild", value);
+    testing::assert(!original.contains("after-rebuild"));
+    testing::assert(alias.contains("after-rebuild"));
+    let latest = resources.values.get();
+    alias.clear();
+    resources.set("fresh", value);
+    testing::assert(!latest.contains("fresh"));
+    testing::assert_eq(alias.slots.get(), 1);
+    testing::assert_some(resources.remove_value("fresh"));
+    testing::assert_eq(alias.len(), 0);
+    testing::assert_eq(alias.slots.get(), 0);
+}
+
+#[test]
+fn resource_session_churn_keeps_tokens_valid_and_releases_empty_tables() -> () {
+    let session = testing::expect_ok(Session::new(3), "session");
+    let alias = session;
+    let keeper = testing::expect_ok(session.begin(Id::Text("keeper"), "keep"), "keeper");
+    for index in 0..2048 {
+        let token = testing::expect_ok(alias.begin(Id::Number(index), "work"), "begin");
+        testing::assert_err(session.begin(Id::Number(index), "duplicate"));
+        testing::assert(session.cancel(token.id()));
+        testing::assert(token.is_cancelled());
+        testing::assert_ok(session.complete(token, Result::Ok(json::Value::Null)));
+        testing::assert(!token.is_active());
+        testing::assert_err(alias.complete(token, Result::Ok(json::Value::Null)));
+        testing::assert(session.incoming.slots.get() <= 18);
+        testing::assert(keeper.is_active());
+    }
+    let first = testing::expect_ok(alias.begin(Id::Number(0), "old"), "old");
+    testing::assert_ok(session.complete(first, Result::Ok(json::Value::Null)));
+    let current = testing::expect_ok(session.begin(Id::Number(0), "current"), "reused");
+    testing::assert_err(alias.complete(first, Result::Ok(json::Value::Null)));
+    testing::assert(current.is_active());
+    let foreign = testing::expect_ok(Session::new(1), "foreign session");
+    testing::assert_err(foreign.complete(keeper, Result::Ok(json::Value::Null)));
+    testing::assert_ok(session.complete(current, Result::Ok(json::Value::Null)));
+    testing::assert_ok(alias.complete(keeper, Result::Ok(json::Value::Null)));
+    testing::assert_eq(session.incoming.slots.get(), 0);
+    let abandoned = testing::expect_ok(session.begin(Id::Number(1), "abandoned"), "incoming");
+    testing::assert_ok(
+        alias.request_with_timeout(
+            Id::Number(1),
+            "outgoing",
+            Option::None,
+            Option::Some(time::Duration::from_seconds(3600)),
+        ),
+    );
+    let outgoing = testing::expect_some(session.outgoing.get(Id::Number(1)), "outgoing token");
+    alias.close();
+    session.close();
+    testing::assert(session.is_closed());
+    testing::assert(abandoned.is_cancelled() && !abandoned.is_active());
+    testing::assert(outgoing.is_cancelled() && !outgoing.is_active());
+    testing::assert_eq(session.incoming.slots.get(), 0);
+    testing::assert_eq(session.outgoing.slots.get(), 0);
+    testing::assert_eq(session.outgoing_deadlines.slots.get(), 0);
+    testing::assert_none(alias.next_outgoing_timeout());
+}
+
+#[test]
+fn resource_outgoing_churn_and_batch_expiration_survive_rebuilding() -> () {
+    let session = testing::expect_ok(Session::new(257), "session");
+    let alias = session;
+    let keeper = Id::Text("keeper");
+    testing::assert_ok(
+        session.request_with_timeout(
+            keeper,
+            "keep",
+            Option::None,
+            Option::Some(time::Duration::from_seconds(3600)),
+        ),
+    );
+    for index in 0..2048 {
+        let id = Id::Number(index);
+        testing::assert_ok(
+            alias.request_with_timeout(
+                id,
+                "work",
+                Option::None,
+                Option::Some(time::Duration::from_seconds(3600)),
+            ),
+        );
+        if index % 2 == 0 {
+            testing::assert_ok(session.expire(id));
+        } else {
+            testing::assert_ok(
+                session.receive(Message::Response(Option::Some(id), Result::Ok(json::Value::Null))),
+            );
+        }
+        testing::assert_eq(alias.outgoing_count(), 1);
+        testing::assert(session.outgoing.slots.get() <= 18);
+        testing::assert(session.outgoing_deadlines.slots.get() <= 18);
+        testing::assert_eq(testing::expect_ok(alias.poll_outgoing_timeouts(), "poll").len(), 0);
+    }
+    for index in 0..256 {
+        testing::assert_ok(
+            session.request_with_timeout(
+                Id::Number(index),
+                "expired",
+                Option::None,
+                Option::Some(time::Duration::from_milliseconds(0)),
+            ),
+        );
+    }
+    let expired = testing::expect_ok(alias.poll_outgoing_timeouts(), "batch expiry");
+    testing::assert_eq(expired.len(), 256);
+    let seen: HashMap[Id, bool] = HashMap::new();
+    for request in expired {
+        testing::assert(!seen.contains(request.completed.id));
+        seen.set(request.completed.id, true);
+        testing::assert_eq(request.completed.method, "expired");
+        testing::assert_eq(testing::expect_err(request.completed.result, "timeout").code, -32803);
+    }
+    testing::assert_eq(session.outgoing_count(), 1);
+    testing::assert(session.outgoing.slots.get() <= 18);
+    testing::assert(session.outgoing_deadlines.slots.get() <= 18);
+    testing::assert_eq(testing::expect_ok(session.poll_outgoing_timeouts(), "repeat").len(), 0);
+    testing::assert_ok(
+        alias.receive(Message::Response(Option::Some(keeper), Result::Ok(json::Value::Null))),
+    );
+    testing::assert_eq(session.outgoing.slots.get(), 0);
+    testing::assert_eq(session.outgoing_deadlines.slots.get(), 0);
+    testing::assert_none(session.next_outgoing_timeout());
+}
+
+#[test]
+fn resource_documents_churn_reclaims_history_without_counting_changes() -> () {
+    let documents = testing::expect_ok(Documents::new(2, 32), "documents");
+    let alias = documents;
+    let keeper = testing::expect_ok(Document::new("file:///keep", "goml", 0, "original"), "keeper");
+    testing::assert_ok(documents.open(keeper));
+    for index in 0..2048 {
+        let uri = "file:///doc/" + index.to_string();
+        let document = testing::expect_ok(Document::new(uri, "goml", 0, "temporary"), "document");
+        testing::assert_ok(alias.open(document));
+        testing::assert_err(documents.open(document));
+        testing::assert_eq(testing::expect_ok(documents.close(uri), "close").content(), "temporary");
+        testing::assert_err(alias.close(uri));
+        testing::assert_eq(alias.len(), 1);
+        testing::assert(documents.values.slots.get() <= 18);
+    }
+    let slots = documents.values.slots.get();
+    for version in 1..1025 {
+        testing::assert_ok(
+            alias.change(
+                keeper.uri(),
+                version,
+                Vec::from_array(
+                    [Change { range: Option::None, range_length: Option::None, text: "changed" }],
+                ),
+            ),
+        );
+        documents.select_encoding(PositionEncoding::Utf8);
+        testing::assert_eq(documents.values.slots.get(), slots);
+    }
+    testing::assert_eq(keeper.content(), "original");
+    let latest = testing::expect_some(alias.get(keeper.uri()), "updated document");
+    testing::assert_eq(latest.content(), "changed");
+    testing::assert_eq(latest.version(), 1024);
+    testing::assert_eq(latest.encoding(), PositionEncoding::Utf8);
+    let closed = testing::expect_ok(alias.close(keeper.uri()), "close last");
+    testing::assert_eq(closed.content(), "changed");
+    testing::assert_eq(documents.len(), 0);
+    testing::assert_eq(documents.values.slots.get(), 0);
+}

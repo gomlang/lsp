@@ -114,6 +114,11 @@ pub struct Server {
     encodings: Vec[PositionEncoding],
     phase_value: Ref[Phase],
     timed_requests: Vec[PendingRequest],
+    initialize_handler: Ref[
+        Option[(InitializeParams, PositionEncoding) -> Result[InitializeResult, RpcError]],
+    ],
+    initialize_params: Ref[Option[InitializeParams]],
+    initializing: Ref[bool],
 }
 
 impl Server {
@@ -142,23 +147,19 @@ impl Server {
         if !encodings.contains(PositionEncoding::Utf16) {
             return Result::Err(invalid("server encodings must include mandatory UTF-16"))
         }
-        let fields = members(capabilities)?.copy();
-        if json::field(capabilities, "positionEncoding").is_some()
-            || json::field(capabilities, "textDocumentSync").is_some() {
-            return Result::Err(
-                invalid("server owns positionEncoding and textDocumentSync capabilities"),
-            )
-        }
-        fields.push(("textDocumentSync", json::Value::Number("2")));
+        let capabilities = initialization_capabilities(capabilities)?;
         Result::Ok(
             Server {
                 router_value: router,
                 documents_value: documents,
                 session_value: Session::new(max_pending)?,
-                capabilities: json::object(fields),
+                capabilities,
                 encodings: encodings.copy(),
                 phase_value: Ref::new(Phase::New),
                 timed_requests: Vec::new(),
+                initialize_handler: Ref::new(Option::None),
+                initialize_params: Ref::new(Option::None),
+                initializing: Ref::new(false),
             },
         )
     }
@@ -188,16 +189,7 @@ impl Server {
             if self.phase() != Phase::New {
                 return Result::Err(RpcError::new(-32600, "server already initialized"))
             }
-            let params = params.ok_or(invalid("initialize params required"))?;
-            let _ = members(params)?;
-            let encoding = negotiate_encoding(required(params, "capabilities")?, self.encodings)?;
-            let fields = members(self.capabilities)?.copy();
-            fields.push(("positionEncoding", json::Value::String(encoding.as_string())));
-            self.documents_value.select_encoding(encoding);
-            self.phase_value.set(Phase::AwaitInitialized);
-            return Result::Ok(
-                json::object(Vec::from_array([("capabilities", json::object(fields))])),
-            )
+            return self.initialize(token, params.ok_or(invalid("initialize params required"))?)
         }
         if self.phase() == Phase::New || self.phase() == Phase::AwaitInitialized {
             return Result::Err(RpcError::new(-32002, "server is not initialized"))

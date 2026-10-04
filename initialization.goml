@@ -1,0 +1,352 @@
+package lsp;
+
+use std::json;
+
+pub struct PeerInfo {
+    pub name: string,
+    pub version: Option[string],
+}
+
+pub struct WorkspaceFolder {
+    pub uri: string,
+    pub name: string,
+}
+
+pub struct InitializeParams {
+    pub process_id: Option[isize],
+    pub client_info: Option[PeerInfo],
+    pub locale: Option[string],
+    pub root_path: Option[string],
+    pub root_uri: Option[string],
+    pub workspace_folders: Option[Option[Vec[WorkspaceFolder]]],
+    pub initialization_options: Option[json::Value],
+    pub capabilities: json::Value,
+    pub trace: string,
+    pub work_done_token: Option[Id],
+    raw_value: json::Value,
+}
+
+pub struct InitializeResult {
+    pub capabilities: json::Value,
+    pub server_info: Option[PeerInfo],
+}
+
+fn initialization_json(value: json::Value, depth: isize, remaining: Ref[isize]) -> Result[
+    json::Value,
+    RpcError,
+] {
+    // Bound snapshots even when an embedding supplies a cyclic JSON value.
+    if depth > 128 || remaining.get() == 0 {
+        return Result::Err(invalid("initialization JSON exceeds depth or node limit"))
+    }
+    remaining.set(remaining.get() - 1);
+    match value {
+        json::Value::Object(fields) => {
+            let seen: HashMap[string, bool] = HashMap::new();
+            let copy = Vec::new();
+            for (key, child) in fields {
+                if seen.contains(key) {
+                    return Result::Err(invalid(f"duplicate initialization field {key}"))
+                }
+                seen.set(key, true);
+                copy.push((key, initialization_json(child, depth + 1, remaining)?));
+            }
+            Result::Ok(json::object(copy))
+        },
+        json::Value::Array(values) => {
+            let copy = Vec::new();
+            for child in values {
+                copy.push(initialization_json(child, depth + 1, remaining)?);
+            }
+            Result::Ok(json::Value::Array(copy))
+        },
+        json::Value::Number(raw) => {
+            if initialization_number(raw) {
+                Result::Ok(value)
+            } else {
+                Result::Err(invalid("invalid initialization number"))
+            }
+        },
+        _ => Result::Ok(value),
+    }
+}
+
+fn initialization_digit(raw: string, index: isize) -> bool {
+    index < raw.byte_len() && raw.byte_get(index) >= b'0' && raw.byte_get(index) <= b'9'
+}
+
+fn initialization_number(raw: string) -> bool {
+    let length = raw.byte_len();
+    let mut index = 0;
+    if length > 0 && raw.byte_get(0) == b'-' {
+        index += 1;
+    }
+    if !initialization_digit(raw, index) {
+        return false
+    }
+    if raw.byte_get(index) == b'0' {
+        index += 1;
+    } else {
+        while initialization_digit(raw, index) {
+            index += 1;
+        }
+    }
+    if index < length && raw.byte_get(index) == b'.' {
+        index += 1;
+        if !initialization_digit(raw, index) {
+            return false
+        }
+        while initialization_digit(raw, index) {
+            index += 1;
+        }
+    }
+    if index < length && (raw.byte_get(index) == b'e' || raw.byte_get(index) == b'E') {
+        index += 1;
+        if index < length && (raw.byte_get(index) == b'+' || raw.byte_get(index) == b'-') {
+            index += 1;
+        }
+        if !initialization_digit(raw, index) {
+            return false
+        }
+        while initialization_digit(raw, index) {
+            index += 1;
+        }
+    }
+    index == length
+}
+
+fn initialization_snapshot(value: json::Value) -> Result[json::Value, RpcError] {
+    initialization_json(value, 0, Ref::new(1000000))
+}
+
+fn initialization_copy(value: json::Value) -> json::Value {
+    // Only used for private, previously validated snapshots.
+    match value {
+        json::Value::Object(fields) => {
+            let copy = Vec::new();
+            for (key, child) in fields {
+                copy.push((key, initialization_copy(child)));
+            }
+            json::object(copy)
+        },
+        json::Value::Array(values) => {
+            let copy = Vec::new();
+            for child in values {
+                copy.push(initialization_copy(child));
+            }
+            json::Value::Array(copy)
+        },
+        _ => value,
+    }
+}
+
+fn initialize_optional_string(value: json::Value, name: string, nullable: bool) -> Result[
+    Option[string],
+    RpcError,
+] {
+    match json::field(value, name) {
+        None => Result::Ok(Option::None),
+        Some(json::Value::Null) => if nullable {
+            Result::Ok(Option::None)
+        } else {
+            Result::Err(invalid(f"{name} must be a string"))
+        },
+        Some(json::Value::String(text)) => Result::Ok(Option::Some(text)),
+        _ => Result::Err(invalid(f"{name} must be a string")),
+    }
+}
+
+impl PeerInfo {
+    pub fn from_json(value: json::Value) -> Result[PeerInfo, RpcError] {
+        let _ = members(value)?;
+        Result::Ok(
+            PeerInfo {
+                name: string_field(value, "name")?,
+                version: initialize_optional_string(value, "version", false)?,
+            },
+        )
+    }
+
+    pub fn to_json(self: PeerInfo) -> json::Value {
+        let fields = Vec::from_array([("name", json::Value::String(self.name))]);
+        if let Some(version) = self.version {
+            fields.push(("version", json::Value::String(version)));
+        }
+        json::object(fields)
+    }
+}
+
+impl WorkspaceFolder {
+    pub fn from_json(value: json::Value) -> Result[WorkspaceFolder, RpcError] {
+        let _ = members(value)?;
+        let uri = string_field(value, "uri")?;
+        if uri == "" {
+            return Result::Err(invalid("workspace folder URI must not be empty"))
+        }
+        Result::Ok(WorkspaceFolder { uri, name: string_field(value, "name")? })
+    }
+}
+
+impl InitializeParams {
+    pub fn from_json(value: json::Value) -> Result[InitializeParams, RpcError] {
+        let value = initialization_snapshot(value)?;
+        let _ = members(value)?;
+        let capabilities = required(value, "capabilities")?;
+        let _ = members(capabilities)?;
+        let process_id = match json::field(value, "processId") {
+            None | Some(json::Value::Null) => Option::None,
+            Some(id) => Option::Some(integer(id)?),
+        };
+        let client_info = match json::field(value, "clientInfo") {
+            None => Option::None,
+            Some(info) => Option::Some(PeerInfo::from_json(info)?),
+        };
+        let root_uri = initialize_optional_string(value, "rootUri", true)?;
+        if root_uri == Option::Some("") {
+            return Result::Err(invalid("root URI must not be empty"))
+        }
+        let workspace_folders = match json::field(value, "workspaceFolders") {
+            None => Option::None,
+            Some(json::Value::Null) => Option::Some(Option::None),
+            Some(json::Value::Array(values)) => {
+                let folders = Vec::new();
+                for folder in values {
+                    folders.push(WorkspaceFolder::from_json(folder)?);
+                }
+                Option::Some(Option::Some(folders))
+            },
+            _ => return Result::Err(invalid("workspaceFolders must be an array or null")),
+        };
+        let trace = initialize_optional_string(value, "trace", false)?.unwrap_or("off");
+        if trace != "off" && trace != "messages" && trace != "verbose" {
+            return Result::Err(invalid("invalid initialization trace value"))
+        }
+        let work_done_token = match json::field(value, "workDoneToken") {
+            None => Option::None,
+            Some(token) => Option::Some(Id::from_json(token)?),
+        };
+        Result::Ok(
+            InitializeParams {
+                process_id,
+                client_info,
+                locale: initialize_optional_string(value, "locale", false)?,
+                root_path: initialize_optional_string(value, "rootPath", true)?,
+                root_uri,
+                workspace_folders,
+                initialization_options: json::field(value, "initializationOptions").map(
+                    |options| initialization_copy(options),
+                ),
+                capabilities: initialization_copy(capabilities),
+                trace,
+                work_done_token,
+                raw_value: value,
+            },
+        )
+    }
+
+    pub fn raw(self: InitializeParams) -> json::Value {
+        initialization_copy(self.raw_value)
+    }
+
+    fn snapshot(self: InitializeParams) -> InitializeParams {
+        InitializeParams {
+            capabilities: initialization_copy(self.capabilities),
+            initialization_options: self.initialization_options.map(
+                |value| initialization_copy(value),
+            ),
+            workspace_folders: self.workspace_folders.map(
+                |folders| folders.map(|values| values.copy()),
+            ),
+            raw_value: initialization_copy(self.raw_value),
+            ..self,
+        }
+    }
+}
+
+impl InitializeResult {
+    pub fn new(capabilities: json::Value) -> InitializeResult {
+        InitializeResult { capabilities, server_info: Option::None }
+    }
+
+    fn response(self: InitializeResult, encoding: PositionEncoding) -> Result[json::Value, RpcError] {
+        let capabilities = initialization_capabilities(self.capabilities)?;
+        let fields = members(capabilities)?;
+        fields.push(("textDocumentSync", json::Value::Number("2")));
+        fields.push(("positionEncoding", json::Value::String(encoding.as_string())));
+        let result = Vec::from_array([("capabilities", json::object(fields))]);
+        if let Some(info) = self.server_info {
+            result.push(("serverInfo", info.to_json()));
+        }
+        Result::Ok(json::object(result))
+    }
+}
+
+fn initialization_capabilities(value: json::Value) -> Result[json::Value, RpcError] {
+    let value = initialization_snapshot(value)?;
+    let _ = members(value)?;
+    if json::field(value, "positionEncoding").is_some()
+        || json::field(value, "textDocumentSync").is_some() {
+        return Result::Err(
+            invalid("server owns positionEncoding and textDocumentSync capabilities"),
+        )
+    }
+    Result::Ok(value)
+}
+
+fn initialization_error(problem: RpcError) -> RpcError {
+    if problem.code < -2147483648 || problem.code > 2147483647 {
+        return RpcError::new(-32603, "invalid initialization callback error code")
+    }
+    let data = match problem.data {
+        None => Option::None,
+        Some(value) => match initialization_snapshot(value) {
+            Ok(value) => Option::Some(value),
+            Err(_) => return RpcError::new(-32603, "invalid initialization callback error data"),
+        },
+    };
+    RpcError { data, ..problem }
+}
+
+impl Server {
+    pub fn on_initialize(
+        self: Server,
+        handler: (InitializeParams, PositionEncoding) -> Result[InitializeResult, RpcError],
+    ) -> Result[(), RpcError] {
+        if self.phase() != Phase::New || self.initializing.get()
+            || self.initialize_handler.get().is_some() {
+            return Result::Err(
+                invalid("initialize handler already registered or initialization started"),
+            )
+        }
+        self.initialize_handler.set(Option::Some(handler));
+        Result::Ok(())
+    }
+
+    pub fn initialization(self: Server) -> Option[InitializeParams] {
+        self.initialize_params.get().map(|params| params.snapshot())
+    }
+
+    fn initialize(self: Server, token: RequestToken, value: json::Value) -> Result[
+        json::Value,
+        RpcError,
+    ] {
+        let params = InitializeParams::from_json(value)?;
+        let encoding = negotiate_encoding(params.capabilities, self.encodings)?;
+        let result = match self.initialize_handler.get() {
+            Some(handler) => {
+                self.initializing.set(true);
+                let result = handler(params.snapshot(), encoding);
+                self.initializing.set(false);
+                result.map_err(|problem| initialization_error(problem))?
+            },
+            None => InitializeResult::new(self.capabilities),
+        };
+        let response = result.response(encoding)?;
+        token.check()?;
+        self.session_value.validate_incoming(token)?;
+        self.documents_value.select_encoding(encoding);
+        self.initialize_params.set(Option::Some(params));
+        self.phase_value.set(Phase::AwaitInitialized);
+        Result::Ok(response)
+    }
+}

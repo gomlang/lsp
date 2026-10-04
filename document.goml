@@ -375,7 +375,7 @@ pub fn utf16_length(value: string) -> isize {
 }
 
 pub struct Documents {
-    values: HashMap[string, Document],
+    values: ResourceMap[string, Document],
     encoding_value: Ref[PositionEncoding],
     max_documents: isize,
     max_bytes: isize,
@@ -395,7 +395,7 @@ impl Documents {
         }
         Result::Ok(
             Documents {
-                values: HashMap::new(),
+                values: ResourceMap::new(),
                 encoding_value: Ref::new(encoding),
                 max_documents,
                 max_bytes,

@@ -1,0 +1,555 @@
+package tests;
+
+use ecosystem::lsp;
+use std::json;
+use std::testing;
+
+fn init_consumer_json(source: string) -> json::Value {
+    testing::expect_ok(json::parse(source), "initialization JSON")
+}
+
+fn init_consumer_field(value: json::Value, name: string) -> json::Value {
+    testing::expect_some(json::field(value, name), name)
+}
+
+fn init_consumer_replace(value: json::Value, name: string, replacement: json::Value) -> () {
+    let json::Value::Object(fields) = value else {
+        testing::fail("expected mutable object");
+        return
+    };
+    for i in 0..fields.len() {
+        if fields[i].0 == name {
+            fields.set(i, (name, replacement));
+            return
+        }
+    }
+    fields.push((name, replacement));
+}
+
+fn init_consumer_server() -> lsp::Server {
+    testing::expect_ok(
+        lsp::Server::new(
+            lsp::Router::new(),
+            testing::expect_ok(lsp::Documents::new(4, 4096), "documents"),
+            8,
+            init_consumer_json("{\"hoverProvider\":true}"),
+        ),
+        "server",
+    )
+}
+
+fn init_consumer_request(server: lsp::Server, params: json::Value) -> Result[
+    json::Value,
+    lsp::RpcError,
+] {
+    let event = testing::expect_ok(
+        server.handle(lsp::Message::Request(lsp::Id::Number(1), "initialize", Option::Some(params))),
+        "initialize event",
+    );
+    let lsp::Message::Response(_, result) = testing::expect_some(event.reply, "initialize reply") else {
+        testing::fail("expected initialize response");
+        return Result::Err(lsp::RpcError::new(-32603, "unexpected message"))
+    };
+    result
+}
+
+#[test]
+fn initialization_consumer_preserves_protocol_fields_and_presence() -> () {
+    let value = init_consumer_json(
+        "{\"processId\":42,\"clientInfo\":{\"name\":\"editor\",\"version\":\"1.2\"},\"locale\":\"zh-CN\",\"rootPath\":\"/legacy\",\"rootUri\":\"file:///work\",\"workspaceFolders\":[{\"uri\":\"file:///work\",\"name\":\"工作区\"}],\"initializationOptions\":{\"index\":true},\"capabilities\":{\"experimental\":{\"custom\":[1,2]}},\"trace\":\"verbose\",\"workDoneToken\":\"starting\",\"futureExtension\":{\"enabled\":true}}",
+    );
+    let params = testing::expect_ok(lsp::InitializeParams::from_json(value), "full params");
+    testing::assert_eq(params.process_id.unwrap_or(-1), 42);
+    let client = testing::expect_some(params.client_info, "client info");
+    testing::assert_eq(client.name, "editor");
+    testing::assert_eq(client.version.unwrap_or(""), "1.2");
+    testing::assert_eq(params.locale.unwrap_or(""), "zh-CN");
+    testing::assert_eq(params.root_path.unwrap_or(""), "/legacy");
+    testing::assert_eq(params.root_uri.unwrap_or(""), "file:///work");
+    let folders = testing::expect_some(
+        testing::expect_some(params.workspace_folders, "folders supplied"),
+        "folders array",
+    );
+    testing::assert_eq(folders.len(), 1);
+    testing::assert_eq(folders[0].uri, "file:///work");
+    testing::assert_eq(folders[0].name, "工作区");
+    testing::assert_eq(params.trace, "verbose");
+    testing::assert_eq(
+        testing::expect_some(params.work_done_token, "progress token"),
+        lsp::Id::Text("starting"),
+    );
+    testing::assert_eq(
+        json::encode(testing::expect_some(params.initialization_options, "options")),
+        "{\"index\":true}",
+    );
+    testing::assert_eq(
+        json::encode(init_consumer_field(params.raw(), "futureExtension")),
+        "{\"enabled\":true}",
+    );
+    testing::assert_eq(json::encode(params.raw()), json::encode(value));
+    let absent = testing::expect_ok(
+        lsp::InitializeParams::from_json(init_consumer_json("{\"capabilities\":{}}")),
+        "legacy minimal params",
+    );
+    testing::assert_none(absent.process_id);
+    testing::assert_none(absent.root_uri);
+    testing::assert_none(absent.workspace_folders);
+    testing::assert_none(absent.initialization_options);
+    testing::assert_none(json::field(absent.raw(), "rootUri"));
+    testing::assert_eq(absent.trace, "off");
+    let nulls = testing::expect_ok(
+        lsp::InitializeParams::from_json(
+            init_consumer_json(
+                "{\"processId\":null,\"rootPath\":null,\"rootUri\":null,\"workspaceFolders\":null,\"initializationOptions\":null,\"capabilities\":{},\"workDoneToken\":7}",
+            ),
+        ),
+        "nullable params",
+    );
+    testing::assert_none(nulls.process_id);
+    testing::assert_none(nulls.root_path);
+    testing::assert_none(nulls.root_uri);
+    testing::assert_none(testing::expect_some(nulls.workspace_folders, "explicit null folders"));
+    testing::assert_eq(
+        json::encode(testing::expect_some(nulls.initialization_options, "explicit null options")),
+        "null",
+    );
+    testing::assert_eq(json::encode(init_consumer_field(nulls.raw(), "rootUri")), "null");
+    testing::assert_eq(
+        testing::expect_some(nulls.work_done_token, "numeric token"),
+        lsp::Id::Number(7),
+    );
+    let empty = testing::expect_ok(
+        lsp::InitializeParams::from_json(
+            init_consumer_json(
+                "{\"workspaceFolders\":[],\"initializationOptions\":[true,null,\"custom\"],\"capabilities\":{},\"trace\":\"messages\"}",
+            ),
+        ),
+        "empty folders",
+    );
+    testing::assert_eq(
+        testing::expect_some(testing::expect_some(empty.workspace_folders, "present"), "array").len(),
+        0,
+    );
+    testing::assert_eq(empty.trace, "messages");
+    testing::assert_eq(
+        json::encode(testing::expect_some(empty.initialization_options, "arbitrary options")),
+        "[true,null,\"custom\"]",
+    );
+}
+
+#[test]
+fn initialization_consumer_rejects_malformed_known_fields() -> () {
+    let invalid_params = Vec::from_array(
+        [
+            "null",
+            "[]",
+            "{}",
+            "{\"capabilities\":null}",
+            "{\"capabilities\":[]}",
+            "{\"capabilities\":{},\"processId\":true}",
+            "{\"capabilities\":{},\"processId\":1.5}",
+            "{\"capabilities\":{},\"processId\":2147483648}",
+            "{\"capabilities\":{},\"clientInfo\":{}}",
+            "{\"capabilities\":{},\"clientInfo\":{\"name\":4}}",
+            "{\"capabilities\":{},\"clientInfo\":{\"name\":\"x\",\"version\":false}}",
+            "{\"capabilities\":{},\"locale\":4}",
+            "{\"capabilities\":{},\"rootPath\":false}",
+            "{\"capabilities\":{},\"rootUri\":4}",
+            "{\"capabilities\":{},\"workspaceFolders\":{}}",
+            "{\"capabilities\":{},\"workspaceFolders\":[{\"name\":\"x\"}]}",
+            "{\"capabilities\":{},\"workspaceFolders\":[{\"uri\":false,\"name\":\"x\"}]}",
+            "{\"capabilities\":{},\"trace\":null}",
+            "{\"capabilities\":{},\"trace\":\"debug\"}",
+            "{\"capabilities\":{},\"workDoneToken\":true}",
+            "{\"capabilities\":{},\"workDoneToken\":1.5}",
+            "{\"capabilities\":{},\"rootUri\":null,\"rootUri\":\"file:///duplicate\"}",
+        ],
+    );
+    for source in invalid_params {
+        testing::assert_eq(
+            testing::expect_err(
+                lsp::InitializeParams::from_json(init_consumer_json(source)),
+                source,
+            ).code,
+            -32602,
+        );
+    }
+}
+
+#[test]
+fn initialization_consumer_snapshots_do_not_share_nested_json_or_folders() -> () {
+    let input = init_consumer_json(
+        "{\"capabilities\":{\"experimental\":{\"enabled\":true}},\"initializationOptions\":{\"index\":{\"enabled\":true}},\"workspaceFolders\":[{\"uri\":\"file:///original\",\"name\":\"original\"}],\"futureExtension\":{\"enabled\":true}}",
+    );
+    let parsed = testing::expect_ok(lsp::InitializeParams::from_json(input), "parse");
+    init_consumer_replace(
+        init_consumer_field(init_consumer_field(input, "capabilities"), "experimental"),
+        "enabled",
+        json::Value::Bool(false),
+    );
+    testing::assert_eq(
+        json::encode(init_consumer_field(parsed.capabilities, "experimental")),
+        "{\"enabled\":true}",
+    );
+    let raw = parsed.raw();
+    init_consumer_replace(
+        init_consumer_field(raw, "futureExtension"),
+        "enabled",
+        json::Value::Bool(false),
+    );
+    testing::assert_eq(
+        json::encode(init_consumer_field(parsed.raw(), "futureExtension")),
+        "{\"enabled\":true}",
+    );
+    let server = init_consumer_server();
+    testing::assert_none(server.initialization());
+    testing::assert_ok(init_consumer_request(server, input));
+    init_consumer_replace(
+        init_consumer_field(init_consumer_field(input, "initializationOptions"), "index"),
+        "enabled",
+        json::Value::Bool(false),
+    );
+    let snapshot = testing::expect_some(server.initialization(), "snapshot");
+    testing::assert_eq(
+        json::encode(testing::expect_some(snapshot.initialization_options, "saved options")),
+        "{\"index\":{\"enabled\":true}}",
+    );
+    init_consumer_replace(
+        init_consumer_field(snapshot.capabilities, "experimental"),
+        "enabled",
+        json::Value::String("changed"),
+    );
+    init_consumer_replace(
+        init_consumer_field(
+            testing::expect_some(snapshot.initialization_options, "options"),
+            "index",
+        ),
+        "enabled",
+        json::Value::Bool(false),
+    );
+    let folders = testing::expect_some(
+        testing::expect_some(snapshot.workspace_folders, "folders"),
+        "array",
+    );
+    folders.set(0, lsp::WorkspaceFolder { uri: "file:///changed", name: "changed" });
+    let fresh = testing::expect_some(server.initialization(), "fresh snapshot");
+    testing::assert_eq(
+        json::encode(init_consumer_field(fresh.capabilities, "experimental")),
+        "{\"enabled\":false}",
+    );
+    testing::assert_eq(
+        json::encode(testing::expect_some(fresh.initialization_options, "fresh options")),
+        "{\"index\":{\"enabled\":true}}",
+    );
+    testing::assert_eq(
+        testing::expect_some(
+            testing::expect_some(fresh.workspace_folders, "fresh folders"),
+            "fresh array",
+        )[0].uri,
+        "file:///original",
+    );
+}
+
+#[test]
+fn initialization_consumer_callback_selects_capabilities_and_isolates_aliases() -> () {
+    let server = init_consumer_server();
+    let captured: Ref[Option[lsp::InitializeParams]] = Ref::new(Option::None);
+    let result_capabilities = init_consumer_json(
+        "{\"completionProvider\":{\"resolveProvider\":true}}",
+    );
+    testing::assert_ok(
+        server.on_initialize(
+            |params, encoding| {
+                testing::assert_eq(encoding, lsp::PositionEncoding::Utf8);
+                testing::assert_eq(
+                    json::encode(
+                        init_consumer_field(
+                            init_consumer_field(params.capabilities, "textDocument"),
+                            "completion",
+                        ),
+                    ),
+                    "{\"dynamicRegistration\":true}",
+                );
+                testing::assert_none(server.initialization());
+                testing::assert_eq(server.phase(), lsp::Phase::New);
+                captured.set(Option::Some(params));
+                init_consumer_replace(
+                    init_consumer_field(params.capabilities, "experimental"),
+                    "enabled",
+                    json::Value::Bool(false),
+                );
+                Result::Ok(
+                    lsp::InitializeResult {
+                        capabilities: result_capabilities,
+                        server_info: Option::Some(
+                            lsp::PeerInfo { name: "consumer server", version: Option::Some("0.1") },
+                        ),
+                    },
+                )
+            },
+        ),
+    );
+    let reply = testing::expect_ok(
+        init_consumer_request(
+            server,
+            init_consumer_json(
+                "{\"capabilities\":{\"general\":{\"positionEncodings\":[\"utf-8\"]},\"textDocument\":{\"completion\":{\"dynamicRegistration\":true}},\"experimental\":{\"enabled\":true}}}",
+            ),
+        ),
+        "initialized",
+    );
+    let advertised = init_consumer_field(reply, "capabilities");
+    testing::assert_none(json::field(advertised, "hoverProvider"));
+    testing::assert_eq(
+        json::encode(init_consumer_field(advertised, "completionProvider")),
+        "{\"resolveProvider\":true}",
+    );
+    testing::assert_eq(
+        json::as_string(init_consumer_field(advertised, "positionEncoding")).unwrap_or(""),
+        "utf-8",
+    );
+    testing::assert_eq(
+        json::as_int(init_consumer_field(advertised, "textDocumentSync")).unwrap_or(-1),
+        2,
+    );
+    testing::assert_eq(
+        json::encode(init_consumer_field(reply, "serverInfo")),
+        "{\"name\":\"consumer server\",\"version\":\"0.1\"}",
+    );
+    testing::assert_eq(server.position_encoding(), lsp::PositionEncoding::Utf8);
+    testing::assert_eq(server.phase(), lsp::Phase::AwaitInitialized);
+    let passed = testing::expect_some(captured.get(), "captured callback argument");
+    init_consumer_replace(
+        init_consumer_field(passed.capabilities, "experimental"),
+        "enabled",
+        json::Value::String("late mutation"),
+    );
+    testing::assert_eq(
+        json::encode(
+            init_consumer_field(
+                testing::expect_some(server.initialization(), "stored params").capabilities,
+                "experimental",
+            ),
+        ),
+        "{\"enabled\":true}",
+    );
+    init_consumer_replace(
+        init_consumer_field(result_capabilities, "completionProvider"),
+        "resolveProvider",
+        json::Value::Bool(false),
+    );
+    testing::assert_eq(
+        json::encode(init_consumer_field(advertised, "completionProvider")),
+        "{\"resolveProvider\":true}",
+    );
+}
+
+#[test]
+fn initialization_consumer_failed_callback_and_invalid_result_allow_retry() -> () {
+    let server = init_consumer_server();
+    let attempts = Ref::new(0);
+    testing::assert_ok(
+        server.on_initialize(
+            |_, encoding| {
+                testing::assert_eq(encoding, lsp::PositionEncoding::Utf8);
+                attempts.set(attempts.get() + 1);
+                if attempts.get() == 1 {
+                    return Result::Err(
+                        lsp::RpcError {
+                            code: -32001,
+                            message: "configuration rejected",
+                            data: Option::Some(init_consumer_json("{\"retry\":true}")),
+                        },
+                    )
+                }
+                if attempts.get() == 2 {
+                    return Result::Ok(
+                        lsp::InitializeResult::new(
+                            init_consumer_json("{\"positionEncoding\":\"utf-32\"}"),
+                        ),
+                    )
+                }
+                if attempts.get() == 3 {
+                    return Result::Ok(
+                        lsp::InitializeResult::new(init_consumer_json("{\"textDocumentSync\":0}")),
+                    )
+                }
+                Result::Ok(
+                    lsp::InitializeResult::new(init_consumer_json("{\"hoverProvider\":true}")),
+                )
+            },
+        ),
+    );
+    let input = init_consumer_json(
+        "{\"rootUri\":\"file:///retry\",\"capabilities\":{\"general\":{\"positionEncodings\":[\"utf-8\"]}}}",
+    );
+    for attempt in 1..4 {
+        let problem = testing::expect_err(init_consumer_request(server, input), "rejected attempt");
+        if attempt == 1 {
+            testing::assert_eq(problem.code, -32001);
+            testing::assert_eq(
+                json::encode(testing::expect_some(problem.data, "retry data")),
+                "{\"retry\":true}",
+            );
+        }
+        testing::assert_eq(server.phase(), lsp::Phase::New);
+        testing::assert_eq(server.position_encoding(), lsp::PositionEncoding::Utf16);
+        testing::assert_none(server.initialization());
+    }
+    testing::assert_ok(init_consumer_request(server, input));
+    testing::assert_eq(attempts.get(), 4);
+    testing::assert_eq(server.phase(), lsp::Phase::AwaitInitialized);
+    testing::assert_eq(server.position_encoding(), lsp::PositionEncoding::Utf8);
+    testing::assert_eq(
+        testing::expect_some(server.initialization(), "committed").root_uri.unwrap_or(""),
+        "file:///retry",
+    );
+}
+
+#[test]
+fn initialization_consumer_registration_and_dispatch_reentry_are_rejected() -> () {
+    let server = init_consumer_server();
+    let invocations = Ref::new(0);
+    testing::assert_ok(
+        server.on_initialize(
+            |_, _| {
+                invocations.set(invocations.get() + 1);
+                testing::assert_err(
+                    server.on_initialize(
+                        |_, _| Result::Ok(lsp::InitializeResult::new(json::object(Vec::new()))),
+                    ),
+                );
+                testing::assert_err(server.handle(lsp::Message::Notification("exit", Option::None)));
+                testing::assert_err(
+                    server.handle(lsp::Message::Notification("initialized", Option::None)),
+                );
+                testing::assert_err(
+                    server.handle(
+                        lsp::Message::Request(
+                            lsp::Id::Number(2),
+                            "initialize",
+                            Option::Some(init_consumer_json("{\"capabilities\":{}}")),
+                        ),
+                    ),
+                );
+                testing::assert_eq(server.phase(), lsp::Phase::New);
+                testing::assert_none(server.initialization());
+                Result::Ok(lsp::InitializeResult::new(json::object(Vec::new())))
+            },
+        ),
+    );
+    testing::assert_err(
+        server.on_initialize(
+            |_, _| Result::Ok(lsp::InitializeResult::new(json::object(Vec::new()))),
+        ),
+    );
+    testing::assert_ok(init_consumer_request(server, init_consumer_json("{\"capabilities\":{}}")));
+    testing::assert_eq(invocations.get(), 1);
+    testing::assert_err(
+        server.on_initialize(
+            |_, _| Result::Ok(lsp::InitializeResult::new(json::object(Vec::new()))),
+        ),
+    );
+    testing::assert_ok(server.handle(lsp::Message::Notification("initialized", Option::None)));
+    testing::assert_err(
+        server.on_initialize(
+            |_, _| Result::Ok(lsp::InitializeResult::new(json::object(Vec::new()))),
+        ),
+    );
+    testing::assert_err(init_consumer_request(server, init_consumer_json("{\"capabilities\":{}}")));
+    testing::assert_eq(invocations.get(), 1);
+}
+
+#[test]
+fn initialization_consumer_callback_errors_are_bounded_snapshots_and_release_requests() -> () {
+    let server = testing::expect_ok(
+        lsp::Server::new(
+            lsp::Router::new(),
+            testing::expect_ok(lsp::Documents::new(1, 1024), "documents"),
+            1,
+            json::object(Vec::new()),
+        ),
+        "single pending request server",
+    );
+    let cyclic_fields: Vec[(string, json::Value)] = Vec::new();
+    let cyclic_data = json::object(cyclic_fields);
+    cyclic_fields.push(("self", cyclic_data));
+    let shared_data = init_consumer_json("{\"retry\":true,\"reason\":{\"setting\":\"index\"}}");
+    let attempts = Ref::new(0);
+    testing::assert_ok(
+        server.on_initialize(
+            |_, _| {
+                attempts.set(attempts.get() + 1);
+                if attempts.get() == 1 {
+                    return Result::Err(lsp::RpcError::new(2147483648, "above signed LSP integer"))
+                }
+                if attempts.get() == 2 {
+                    return Result::Err(lsp::RpcError::new(-2147483649, "below signed LSP integer"))
+                }
+                if attempts.get() == 3 {
+                    return Result::Err(
+                        lsp::RpcError {
+                            code: -32001,
+                            message: "cyclic data",
+                            data: Option::Some(cyclic_data),
+                        },
+                    )
+                }
+                if attempts.get() == 4 {
+                    return Result::Err(
+                        lsp::RpcError {
+                            code: -32001,
+                            message: "configuration rejected",
+                            data: Option::Some(shared_data),
+                        },
+                    )
+                }
+                Result::Ok(lsp::InitializeResult::new(json::object(Vec::new())))
+            },
+        ),
+    );
+    let input = init_consumer_json(
+        "{\"capabilities\":{\"general\":{\"positionEncodings\":[\"utf-8\"]}}}",
+    );
+    // Every attempt reuses request ID 1 with a capacity of exactly one request.
+    for attempt in 1..4 {
+        let problem = testing::expect_err(
+            init_consumer_request(server, input),
+            "normalized callback error",
+        );
+        testing::assert_eq(problem.code, -32603);
+        testing::assert_eq(attempts.get(), attempt);
+        testing::assert_ok(
+            lsp::encode(
+                lsp::Message::Response(Option::Some(lsp::Id::Number(1)), Result::Err(problem)),
+            ),
+        );
+        testing::assert_eq(server.phase(), lsp::Phase::New);
+        testing::assert_eq(server.position_encoding(), lsp::PositionEncoding::Utf16);
+        testing::assert_none(server.initialization());
+    }
+    let preserved = testing::expect_err(
+        init_consumer_request(server, input),
+        "valid callback error",
+    );
+    testing::assert_eq(preserved.code, -32001);
+    testing::assert_eq(preserved.message, "configuration rejected");
+    init_consumer_replace(
+        init_consumer_field(shared_data, "reason"),
+        "setting",
+        json::Value::String("changed"),
+    );
+    testing::assert_eq(
+        json::encode(testing::expect_some(preserved.data, "detached error data")),
+        "{\"retry\":true,\"reason\":{\"setting\":\"index\"}}",
+    );
+    testing::assert_ok(
+        lsp::encode(
+            lsp::Message::Response(Option::Some(lsp::Id::Number(1)), Result::Err(preserved)),
+        ),
+    );
+    testing::assert_ok(init_consumer_request(server, input));
+    testing::assert_eq(attempts.get(), 5);
+    testing::assert_eq(server.phase(), lsp::Phase::AwaitInitialized);
+    testing::assert_eq(server.position_encoding(), lsp::PositionEncoding::Utf8);
+}

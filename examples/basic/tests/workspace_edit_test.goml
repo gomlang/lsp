@@ -1,0 +1,171 @@
+package tests;
+
+use ecosystem::lsp;
+use std::json;
+use std::testing;
+
+fn public_workspace_document(encoding: lsp::PositionEncoding, width: isize) -> (
+    lsp::Document,
+    lsp::TextDocumentEdit,
+) {
+    let doc = testing::expect_ok(
+        lsp::Document::new_with_encoding("file:///unicode", "text", 7, "😀!\n界", encoding),
+        "document",
+    );
+    let edit = lsp::TextDocumentEdit {
+        uri: doc.uri(),
+        version: Option::Some(7),
+        edits: Vec::from_array(
+            [
+                lsp::DocumentTextEdit::Plain(
+                    lsp::TextEdit {
+                        range: lsp::Range {
+                            start: lsp::Position { line: 0, character: 0 },
+                            end: lsp::Position { line: 0, character: width },
+                        },
+                        new_text: "Hello",
+                    },
+                ),
+            ],
+        ),
+    };
+    (doc, edit)
+}
+
+#[test]
+fn downstream_workspace_edit_checks_negotiated_coordinates_and_snapshot_versions() -> () {
+    for (encoding, width) in[
+        (lsp::PositionEncoding::Utf8, 4),
+        (lsp::PositionEncoding::Utf16, 2),
+        (lsp::PositionEncoding::Utf32, 1),
+    ] {
+        let (doc, edit) = public_workspace_document(encoding, width);
+        testing::assert_ok(edit.validate_document(doc));
+        testing::assert_eq(
+            testing::expect_ok(
+                doc.apply_edits(Vec::from_array([edit.edits[0].text_edit()])),
+                "applied snapshot",
+            ),
+            "Hello!\n界",
+        );
+        testing::assert_err(
+            lsp::TextDocumentEdit { version: Option::Some(6), ..edit }.validate_document(doc),
+        );
+        testing::assert_err(
+            lsp::TextDocumentEdit { uri: "file:///other", ..edit }.validate_document(doc),
+        );
+        testing::assert_ok(
+            lsp::TextDocumentEdit { version: Option::None, ..edit }.validate_document(doc),
+        );
+        testing::assert_eq(doc.content(), "😀!\n界");
+        testing::assert_eq(doc.version(), 7);
+    }
+}
+
+#[test]
+fn downstream_workspace_edit_rejects_split_scalars_and_clamped_overlap() -> () {
+    for encoding in[lsp::PositionEncoding::Utf8, lsp::PositionEncoding::Utf16] {
+        let (doc, edit) = public_workspace_document(encoding, 1);
+        testing::assert_ok(edit.to_json());
+        testing::assert_err(edit.validate_document(doc));
+    }
+    let (doc, edit) = public_workspace_document(lsp::PositionEncoding::Utf16, 2);
+    let edits = Vec::from_array(
+        [
+            lsp::DocumentTextEdit::Plain(
+                lsp::TextEdit {
+                    range: lsp::Range {
+                        start: lsp::Position { line: 0, character: 99 },
+                        end: lsp::Position { line: 1, character: 0 },
+                    },
+                    new_text: "one",
+                },
+            ),
+            lsp::DocumentTextEdit::Plain(
+                lsp::TextEdit {
+                    range: lsp::Range {
+                        start: lsp::Position { line: 0, character: 100 },
+                        end: lsp::Position { line: 0, character: 100 },
+                    },
+                    new_text: "two",
+                },
+            ),
+        ],
+    );
+    testing::assert_err(lsp::TextDocumentEdit { edits, ..edit }.validate_document(doc));
+}
+
+#[test]
+fn downstream_workspace_edit_capability_negotiation_and_apply_response() -> () {
+    let capabilities = testing::expect_ok(
+        json::parse(
+            "{\"workspace\":{\"applyEdit\":true,\"workspaceEdit\":{\"documentChanges\":true,\"resourceOperations\":[\"create\"],\"changeAnnotationSupport\":{}}}}",
+        ),
+        "capabilities JSON",
+    );
+    let capabilities = testing::expect_ok(
+        lsp::WorkspaceEditCapabilities::from_client_capabilities(capabilities),
+        "capabilities",
+    );
+    let create = lsp::CreateFile {
+        uri: "file:///created",
+        options: Option::Some(
+            lsp::CreateFileOptions {
+                overwrite: Option::Some(false),
+                ..lsp::CreateFileOptions::new(),
+            },
+        ),
+        annotation_id: Option::Some("create"),
+    };
+    let changes = Vec::from_array(
+        [
+            lsp::DocumentChange::Create(create),
+            lsp::DocumentChange::Edit(
+                lsp::TextDocumentEdit { uri: create.uri, version: Option::None, edits: Vec::new() },
+            ),
+        ],
+    );
+    let edit = lsp::WorkspaceEdit {
+        document_changes: Option::Some(changes),
+        change_annotations: Option::Some(
+            Vec::from_array(
+                [
+                    (
+                        "create",
+                        lsp::ChangeAnnotation {
+                            label: "Create document",
+                            needs_confirmation: Option::Some(true),
+                            description: Option::None,
+                        },
+                    ),
+                ],
+            ),
+        ),
+        ..lsp::WorkspaceEdit::new(),
+    };
+    let params = testing::expect_ok(
+        lsp::ApplyWorkspaceEditParams { label: Option::Some("Generate file"), edit }.to_json_for(
+            capabilities,
+        ),
+        "params",
+    );
+    let request = lsp::Message::Request(
+        lsp::Id::Text("edit-1"),
+        "workspace/applyEdit",
+        Option::Some(params),
+    );
+    let wire = testing::expect_ok(lsp::encode(request), "wire");
+    testing::assert_ok(lsp::decode(wire));
+    let result = testing::expect_ok(
+        lsp::ApplyWorkspaceEditResult::from_json(
+            testing::expect_ok(
+                json::parse("{\"applied\":false,\"failureReason\":\"declined\",\"failedChange\":0}"),
+                "response",
+            ),
+        ),
+        "result",
+    );
+    testing::assert(!result.applied);
+    testing::assert_eq(testing::expect_some(result.failed_change, "index"), 0);
+    testing::assert_eq(testing::expect_some(result.failure_reason, "reason"), "declined");
+}

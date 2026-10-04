@@ -1,0 +1,68 @@
+package lsp;
+
+// HashMap deletion retains historical storage. Keep an upper bound on newly
+// inserted entries and rebuild occasionally, so storage and entries() scans
+// follow the live resource count instead of the lifetime of the server.
+
+struct ResourceMap[K, V] {
+    values: Ref[HashMap[K, V]],
+    slots: Ref[isize],
+}
+
+impl[K: Eq + Hash, V] ResourceMap[K, V] {
+    fn new() -> ResourceMap[K, V] {
+        ResourceMap { values: Ref::new(HashMap::new()), slots: Ref::new(0) }
+    }
+
+    fn len(self: ResourceMap[K, V]) -> isize {
+        self.values.get().len()
+    }
+
+    fn get(self: ResourceMap[K, V], key: K) -> Option[V] {
+        self.values.get().get(key)
+    }
+
+    fn contains(self: ResourceMap[K, V], key: K) -> bool {
+        self.values.get().contains(key)
+    }
+
+    fn set(self: ResourceMap[K, V], key: K, value: V) -> () {
+        let values = self.values.get();
+        if !values.contains(key) {
+            self.slots.set(self.slots.get() + 1);
+        }
+        values.set(key, value);
+    }
+
+    fn entries(self: ResourceMap[K, V]) -> Vec[(K, V)] {
+        self.values.get().entries()
+    }
+
+    fn clear(self: ResourceMap[K, V]) -> () {
+        self.values.set(HashMap::new());
+        self.slots.set(0);
+    }
+
+    fn remove_value(self: ResourceMap[K, V], key: K) -> Option[V] {
+        let removed = self.values.get().remove_value(key);
+        if removed.is_some() {
+            let live = self.len();
+            let historical = self.slots.get();
+            if live == 0 {
+                self.clear();
+            } else if historical - live > live && historical - live - live > 16 {
+                let replacement = HashMap::new();
+                for (key, value) in self.entries() {
+                    replacement.set(key, value);
+                }
+                self.values.set(replacement);
+                self.slots.set(live);
+            }
+        }
+        removed
+    }
+
+    fn remove(self: ResourceMap[K, V], key: K) -> () {
+        let _ = self.remove_value(key);
+    }
+}

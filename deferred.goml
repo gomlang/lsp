@@ -49,6 +49,9 @@ impl Server {
         Dispatch,
         RpcError,
     ] {
+        if self.initializing.get() {
+            return Result::Err(invalid("server dispatch during initialization callback"))
+        }
         let _ = decode_value(encode_value(message))?;
         self.prune_timeouts();
         if let Message::Request(id, method, params) = message {

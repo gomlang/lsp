@@ -1,0 +1,61 @@
+package lsp;
+
+use std::json;
+use std::testing;
+
+#[test]
+fn initialization_snapshot_bounds_cycles_depth_and_expanded_nodes() -> () {
+    let cycle = Vec::new();
+    let value = json::Value::Array(cycle);
+    cycle.push(value);
+    testing::assert_err(initialization_snapshot(value));
+    let mut nested = json::Value::Null;
+    for _ in 0..128 {
+        nested = json::Value::Array(Vec::from_array([nested]));
+    }
+    testing::assert_ok(initialization_snapshot(nested));
+    testing::assert_err(initialization_snapshot(json::Value::Array(Vec::from_array([nested]))));
+    let leaves = json::Value::Array(Vec::from_array([json::Value::Null, json::Value::Bool(false)]));
+    let shared = json::Value::Array(Vec::from_array([leaves, leaves]));
+    testing::assert_ok(initialization_json(shared, 0, Ref::new(7)));
+    testing::assert_err(initialization_json(shared, 0, Ref::new(6)));
+    let duplicate = json::object(
+        Vec::from_array([("name", json::Value::Null), ("name", json::Value::Null)]),
+    );
+    testing::assert_err(initialization_snapshot(json::Value::Array(Vec::from_array([duplicate]))));
+}
+
+#[test]
+fn initialization_snapshot_checks_numeric_lexemes_without_parsing_structure() -> () {
+    for valid in["0", "-0", "12", "-23.45", "1e10000", "1E-5", "0.25e+03"] {
+        let copied = testing::expect_ok(
+            initialization_snapshot(json::Value::Number(valid)),
+            "number",
+        );
+        testing::assert_eq(json::encode(copied), valid);
+    }
+    for invalid in[
+        "",
+        "01",
+        "-01",
+        "+1",
+        "1.",
+        ".1",
+        "1e",
+        "1e+",
+        "--1",
+        "NaN",
+        "1 2",
+        " 1",
+        "1 ",
+        "[]",
+        "true",
+    ] {
+        testing::assert_err(initialization_snapshot(json::Value::Number(invalid)));
+    }
+    let mut disguised = "0";
+    for _ in 0..512 {
+        disguised = "[" + disguised + "]";
+    }
+    testing::assert_err(initialization_snapshot(json::Value::Number(disguised)));
+}

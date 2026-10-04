@@ -1,0 +1,452 @@
+package tests;
+
+use ecosystem::lsp;
+use std::json;
+use std::testing;
+
+fn workspace_json(source: string) -> json::Value {
+    testing::expect_ok(json::parse(source), "JSON")
+}
+
+fn workspace_text(start: isize, end: isize, replacement: string) -> lsp::TextEdit {
+    lsp::TextEdit {
+        range: lsp::Range {
+            start: lsp::Position { line: 0, character: start },
+            end: lsp::Position { line: 0, character: end },
+        },
+        new_text: replacement,
+    }
+}
+
+fn workspace_document(uri: string, version: Option[isize], edits: Vec[lsp::TextEdit]) -> lsp::TextDocumentEdit {
+    let values = Vec::new();
+    for edit in edits {
+        values.push(lsp::DocumentTextEdit::Plain(edit));
+    }
+    lsp::TextDocumentEdit { uri, version, edits: values }
+}
+
+fn workspace_wrap(edit: lsp::TextDocumentEdit) -> lsp::WorkspaceEdit {
+    lsp::WorkspaceEdit {
+        document_changes: Option::Some(Vec::from_array([lsp::DocumentChange::Edit(edit)])),
+        ..lsp::WorkspaceEdit::new(),
+    }
+}
+
+#[test]
+fn workspace_preserves_absence_empty_false_and_required_null_version() -> () {
+    for encoded in[
+        "{}",
+        "{\"changes\":{}}",
+        "{\"documentChanges\":[]}",
+        "{\"changeAnnotations\":{}}",
+    ] {
+        let edit = testing::expect_ok(
+            lsp::WorkspaceEdit::from_json(workspace_json(encoded)),
+            "empty edit",
+        );
+        testing::assert_eq(json::encode(testing::expect_ok(edit.to_json(), "encode")), encoded);
+    }
+    let edit = workspace_document("file:///a", Option::None, Vec::new());
+    testing::assert_eq(
+        json::encode(testing::expect_ok(edit.to_json(), "null version")),
+        "{\"textDocument\":{\"uri\":\"file:///a\",\"version\":null},\"edits\":[]}",
+    );
+    let annotation = lsp::ChangeAnnotation {
+        label: "",
+        needs_confirmation: Option::Some(false),
+        description: Option::Some(""),
+    };
+    testing::assert_eq(
+        json::encode(annotation.to_json()),
+        "{\"label\":\"\",\"needsConfirmation\":false,\"description\":\"\"}",
+    );
+    let options = lsp::CreateFileOptions {
+        overwrite: Option::Some(false),
+        ignore_if_exists: Option::None,
+    };
+    testing::assert_eq(json::encode(options.to_json()), "{\"overwrite\":false}");
+}
+
+#[test]
+fn workspace_versions_and_constructed_ranges_are_checked() -> () {
+    for version in[-2147483648, 2147483647] {
+        testing::assert_ok(
+            workspace_document("file:///a", Option::Some(version), Vec::new()).to_json(),
+        );
+    }
+    for version in[-2147483649, 2147483648] {
+        testing::assert_err(
+            workspace_document("file:///a", Option::Some(version), Vec::new()).to_json(),
+        );
+    }
+    testing::assert_err(workspace_document("", Option::None, Vec::new()).to_json());
+    for (start, end) in[(-1, 0), (2, 1), (0, 2147483648)] {
+        testing::assert_err(
+            workspace_document(
+                "file:///a",
+                Option::None,
+                Vec::from_array([workspace_text(start, end, "x")]),
+            ).to_json(),
+        );
+    }
+    for encoded in[
+        "{\"textDocument\":{\"uri\":\"a\"},\"edits\":[]}",
+        "{\"textDocument\":{\"uri\":\"a\",\"version\":1.5},\"edits\":[]}",
+        "{\"textDocument\":{\"uri\":\"a\",\"version\":true},\"edits\":[]}",
+    ] {
+        testing::assert_err(lsp::TextDocumentEdit::from_json(workspace_json(encoded)));
+    }
+}
+
+#[test]
+fn workspace_overlap_rules_preserve_insert_order_without_mutation() -> () {
+    let edits = Vec::from_array(
+        [
+            workspace_text(8, 9, "end"),
+            workspace_text(2, 2, "first"),
+            workspace_text(2, 2, "second"),
+            workspace_text(2, 4, "replacement"),
+        ],
+    );
+    let document = workspace_document("file:///a", Option::None, edits);
+    testing::assert_ok(document.to_json());
+    testing::assert_eq(document.edits[0].text_edit().new_text, "end");
+    testing::assert_eq(document.edits[1].text_edit().new_text, "first");
+    for bad in[
+        Vec::from_array([workspace_text(2, 4, "x"), workspace_text(2, 2, "y")]),
+        Vec::from_array([workspace_text(2, 5, "x"), workspace_text(3, 3, "y")]),
+        Vec::from_array([workspace_text(2, 5, "x"), workspace_text(4, 6, "y")]),
+    ] {
+        testing::assert_err(workspace_document("a", Option::None, bad).to_json());
+    }
+    testing::assert_ok(
+        workspace_document(
+            "a",
+            Option::None,
+            Vec::from_array([workspace_text(1, 2, "x"), workspace_text(2, 3, "y")]),
+        ).to_json(),
+    );
+}
+
+#[test]
+fn workspace_annotations_must_resolve_and_duplicates_are_rejected() -> () {
+    let annotated = lsp::AnnotatedTextEdit {
+        range: workspace_text(0, 0, "").range,
+        new_text: "hello",
+        annotation_id: "confirm",
+    };
+    let doc = lsp::TextDocumentEdit {
+        uri: "file:///a",
+        version: Option::None,
+        edits: Vec::from_array([lsp::DocumentTextEdit::Annotated(annotated)]),
+    };
+    let edit = workspace_wrap(doc);
+    testing::assert_err(edit.to_json());
+    let annotation = lsp::ChangeAnnotation {
+        label: "rename",
+        needs_confirmation: Option::Some(true),
+        description: Option::None,
+    };
+    let defined = lsp::WorkspaceEdit {
+        change_annotations: Option::Some(Vec::from_array([("confirm", annotation)])),
+        ..edit,
+    };
+    testing::assert_ok(defined.to_json());
+    testing::assert_err(defined.to_json_for(lsp::WorkspaceEditCapabilities::new()));
+    testing::assert_err(
+        lsp::WorkspaceEdit {
+            change_annotations: Option::Some(
+                Vec::from_array([("confirm", annotation), ("confirm", annotation)]),
+            ),
+            ..edit,
+        }.to_json(),
+    );
+    testing::assert_err(
+        lsp::WorkspaceEdit {
+            changes: Option::Some(Vec::from_array([("a", Vec::new()), ("a", Vec::new())])),
+            ..lsp::WorkspaceEdit::new(),
+        }.to_json(),
+    );
+}
+
+#[test]
+fn workspace_resource_operations_round_trip_in_original_order() -> () {
+    let source = "{\"documentChanges\":[{\"kind\":\"create\",\"uri\":\"file:///a\",\"options\":{\"overwrite\":false,\"ignoreIfExists\":true},\"annotationId\":\"a\"},{\"textDocument\":{\"uri\":\"file:///a\",\"version\":null},\"edits\":[]},{\"kind\":\"rename\",\"oldUri\":\"file:///a\",\"newUri\":\"file:///b\",\"options\":{}},{\"kind\":\"delete\",\"uri\":\"file:///b\",\"options\":{\"recursive\":false,\"ignoreIfNotExists\":false}}],\"changeAnnotations\":{\"a\":{\"label\":\"create\",\"needsConfirmation\":true}}}";
+    let edit = testing::expect_ok(
+        lsp::WorkspaceEdit::from_json(workspace_json(source)),
+        "resource edit",
+    );
+    testing::assert_eq(json::encode(testing::expect_ok(edit.to_json(), "resource encode")), source);
+    let caps = testing::expect_ok(
+        lsp::WorkspaceEditCapabilities::from_json(
+            workspace_json(
+                "{\"documentChanges\":true,\"resourceOperations\":[\"create\",\"rename\",\"delete\"],\"changeAnnotationSupport\":{}}",
+            ),
+        ),
+        "capabilities",
+    );
+    testing::assert_eq(
+        json::encode(testing::expect_ok(edit.to_json_for(caps), "supported")),
+        source,
+    );
+    testing::assert_err(
+        edit.to_json_for(
+            lsp::WorkspaceEditCapabilities {
+                resource_operations: Option::Some(
+                    Vec::from_array([lsp::ResourceOperationKind::Create]),
+                ),
+                ..caps,
+            },
+        ),
+    );
+}
+
+#[test]
+fn workspace_legacy_downgrade_rejects_lost_version_annotations_and_sequence() -> () {
+    let caps = lsp::WorkspaceEditCapabilities::new();
+    let doc = workspace_document(
+        "file:///a",
+        Option::None,
+        Vec::from_array([workspace_text(0, 0, "x")]),
+    );
+    let legacy = testing::expect_ok(workspace_wrap(doc).for_client(caps), "legacy");
+    testing::assert(legacy.document_changes.is_none());
+    testing::assert(legacy.changes.is_some());
+    testing::assert_eq(
+        json::encode(testing::expect_ok(legacy.to_json(), "legacy JSON")),
+        "{\"changes\":{\"file:///a\":[{\"range\":{\"start\":{\"line\":0,\"character\":0},\"end\":{\"line\":0,\"character\":0}},\"newText\":\"x\"}]}}",
+    );
+    testing::assert_err(
+        workspace_wrap(lsp::TextDocumentEdit { version: Option::Some(7), ..doc }).for_client(caps),
+    );
+    let sequential = lsp::WorkspaceEdit {
+        document_changes: Option::Some(
+            Vec::from_array([lsp::DocumentChange::Edit(doc), lsp::DocumentChange::Edit(doc)]),
+        ),
+        ..lsp::WorkspaceEdit::new(),
+    };
+    testing::assert_err(sequential.for_client(caps));
+    let annotation_caps = lsp::WorkspaceEditCapabilities {
+        change_annotation_support: Option::Some(
+            lsp::ChangeAnnotationSupport { groups_on_label: Option::None },
+        ),
+        ..caps,
+    };
+    let annotated = testing::expect_ok(
+        lsp::WorkspaceEdit::from_json(
+            workspace_json(
+                "{\"documentChanges\":[{\"textDocument\":{\"uri\":\"a\",\"version\":null},\"edits\":[{\"range\":{\"start\":{\"line\":0,\"character\":0},\"end\":{\"line\":0,\"character\":0}},\"newText\":\"x\",\"annotationId\":\"a\"}]}],\"changeAnnotations\":{\"a\":{\"label\":\"x\"}}}",
+            ),
+        ),
+        "annotated",
+    );
+    testing::assert_err(annotated.for_client(annotation_caps));
+}
+
+#[test]
+fn workspace_capability_parsing_preserves_presence_and_rejects_invalid_values() -> () {
+    let source = "{\"documentChanges\":false,\"resourceOperations\":[],\"failureHandling\":\"undo\",\"normalizesLineEndings\":false,\"changeAnnotationSupport\":{\"groupsOnLabel\":false}}";
+    let caps = testing::expect_ok(
+        lsp::WorkspaceEditCapabilities::from_json(workspace_json(source)),
+        "capabilities",
+    );
+    testing::assert_eq(json::encode(caps.to_json()), source);
+    for source in["{}", "{\"workspace\":{}}", "{\"workspace\":{\"workspaceEdit\":{}}}"] {
+        testing::assert_eq(
+            json::encode(
+                testing::expect_ok(
+                    lsp::WorkspaceEditCapabilities::from_client_capabilities(workspace_json(source)),
+                    "nested",
+                ).to_json(),
+            ),
+            "{}",
+        );
+    }
+    for source in[
+        "{\"documentChanges\":1}",
+        "{\"resourceOperations\":[1]}",
+        "{\"resourceOperations\":[\"move\"]}",
+        "{\"failureHandling\":\"none\"}",
+        "{\"changeAnnotationSupport\":null}",
+        "{\"normalizesLineEndings\":null}",
+        "{\"changeAnnotationSupport\":{\"groupsOnLabel\":1}}",
+    ] {
+        testing::assert_err(lsp::WorkspaceEditCapabilities::from_json(workspace_json(source)));
+    }
+    for source in["null", "{\"workspace\":null}", "{\"workspace\":{\"workspaceEdit\":false}}"] {
+        testing::assert_err(
+            lsp::WorkspaceEditCapabilities::from_client_capabilities(workspace_json(source)),
+        );
+    }
+    for value in["abort", "transactional", "textOnlyTransactional", "undo"] {
+        let parsed = testing::expect_ok(
+            lsp::FailureHandlingKind::from_json(json::Value::String(value)),
+            "failure handling",
+        );
+        testing::assert_eq(json::encode(parsed.to_json()), json::encode(json::Value::String(value)));
+    }
+}
+
+#[test]
+fn workspace_malformed_structures_are_rejected() -> () {
+    for source in[
+        "null",
+        "{\"changes\":null}",
+        "{\"documentChanges\":{}}",
+        "{\"changes\":{\"\":[]}}",
+        "{\"changes\":{\"a\":null}}",
+        "{\"changes\":{\"a\":[],\"a\":[]}}",
+        "{\"changeAnnotations\":{\"x\":null}}",
+        "{\"documentChanges\":[{\"kind\":1,\"uri\":\"a\"}]}",
+        "{\"documentChanges\":[{\"kind\":\"move\",\"uri\":\"a\"}]}",
+        "{\"documentChanges\":[{\"kind\":\"create\",\"uri\":\"\"}]}",
+        "{\"documentChanges\":[{\"kind\":\"rename\",\"oldUri\":\"a\",\"newUri\":\"\"}]}",
+        "{\"documentChanges\":[{\"kind\":\"delete\",\"uri\":\"a\",\"options\":{\"recursive\":1}}]}",
+        "{\"documentChanges\":[{\"kind\":\"create\",\"uri\":\"a\",\"annotationId\":\"missing\"}]}",
+        "{\"documentChanges\":[{\"kind\":\"rename\",\"oldUri\":\"a\",\"newUri\":\"b\",\"annotationId\":\"missing\"}]}",
+        "{\"documentChanges\":[{\"kind\":\"delete\",\"uri\":\"a\",\"annotationId\":\"missing\"}]}",
+    ] {
+        testing::assert_err(lsp::WorkspaceEdit::from_json(workspace_json(source)));
+    }
+}
+
+#[test]
+fn workspace_apply_edit_params_and_result_validate_wire_values() -> () {
+    let params = lsp::ApplyWorkspaceEditParams {
+        label: Option::Some(""),
+        edit: lsp::WorkspaceEdit::new(),
+    };
+    testing::assert_eq(
+        json::encode(testing::expect_ok(params.to_json(), "params")),
+        "{\"edit\":{},\"label\":\"\"}",
+    );
+    let decoded = testing::expect_ok(
+        lsp::ApplyWorkspaceEditParams::from_json(testing::expect_ok(params.to_json(), "params")),
+        "params read",
+    );
+    testing::assert_eq(testing::expect_some(decoded.label, "label"), "");
+    let result = testing::expect_ok(
+        lsp::ApplyWorkspaceEditResult::from_json(
+            workspace_json("{\"applied\":false,\"failureReason\":\"\",\"failedChange\":0}"),
+        ),
+        "result",
+    );
+    testing::assert_eq(
+        json::encode(testing::expect_ok(result.to_json(), "result JSON")),
+        "{\"applied\":false,\"failureReason\":\"\",\"failedChange\":0}",
+    );
+    for source in[
+        "{}",
+        "{\"applied\":1}",
+        "{\"applied\":false,\"failedChange\":-1}",
+        "{\"applied\":false,\"failedChange\":2147483648}",
+        "{\"applied\":false,\"failureReason\":null}",
+    ] {
+        testing::assert_err(lsp::ApplyWorkspaceEditResult::from_json(workspace_json(source)));
+    }
+    testing::assert_err(
+        lsp::ApplyWorkspaceEditResult { failed_change: Option::Some(-1), ..result }.to_json(),
+    );
+    testing::assert_err(
+        lsp::ApplyWorkspaceEditParams::from_json(workspace_json("{\"label\":false,\"edit\":{}}")),
+    );
+}
+
+#[test]
+fn workspace_resource_capability_is_independent_of_versioned_document_support() -> () {
+    let create = lsp::CreateFile {
+        uri: "file:///a",
+        options: Option::None,
+        annotation_id: Option::None,
+    };
+    let doc = workspace_document(create.uri, Option::None, Vec::new());
+    let changes = Vec::from_array(
+        [lsp::DocumentChange::Create(create), lsp::DocumentChange::Edit(doc)],
+    );
+    let edit = lsp::WorkspaceEdit {
+        document_changes: Option::Some(changes),
+        ..lsp::WorkspaceEdit::new(),
+    };
+    for support in[Option::None, Option::Some(false)] {
+        let caps = lsp::WorkspaceEditCapabilities {
+            document_changes: support,
+            resource_operations: Option::Some(Vec::from_array([lsp::ResourceOperationKind::Create])),
+            ..lsp::WorkspaceEditCapabilities::new(),
+        };
+        testing::assert_eq(
+            json::encode(testing::expect_ok(edit.to_json_for(caps), "resource capability")),
+            json::encode(testing::expect_ok(edit.to_json(), "original")),
+        );
+        testing::assert_err(
+            workspace_wrap(lsp::TextDocumentEdit { version: Option::Some(1), ..doc }).to_json_for(
+                caps,
+            ),
+        );
+    }
+}
+
+#[test]
+fn workspace_dual_representation_round_trips_and_prefers_supported_document_changes() -> () {
+    let source = "{\"changes\":{\"file:///b\":[],\"file:///a\":[]},\"documentChanges\":[{\"textDocument\":{\"uri\":\"file:///a\",\"version\":null},\"edits\":[]},{\"textDocument\":{\"uri\":\"file:///b\",\"version\":null},\"edits\":[]}]}";
+    let dual = testing::expect_ok(
+        lsp::WorkspaceEdit::from_json(workspace_json(source)),
+        "dual representation",
+    );
+    testing::assert_eq(json::encode(testing::expect_ok(dual.to_json(), "raw preservation")), source);
+    let modern = testing::expect_ok(
+        dual.for_client(
+            lsp::WorkspaceEditCapabilities {
+                document_changes: Option::Some(true),
+                ..lsp::WorkspaceEditCapabilities::new(),
+            },
+        ),
+        "modern",
+    );
+    testing::assert(modern.changes.is_none());
+    testing::assert(modern.document_changes.is_some());
+    let legacy = testing::expect_ok(
+        dual.for_client(lsp::WorkspaceEditCapabilities::new()),
+        "equivalent fallback with different map order",
+    );
+    testing::assert_eq(testing::expect_some(legacy.changes, "legacy").len(), 2);
+    testing::assert(legacy.document_changes.is_none());
+    let contradictory = lsp::WorkspaceEdit {
+        changes: Option::Some(Vec::from_array([("different", Vec::new())])),
+        ..dual,
+    };
+    testing::assert_ok(contradictory.to_json());
+    testing::assert_ok(
+        contradictory.for_client(
+            lsp::WorkspaceEditCapabilities {
+                document_changes: Option::Some(true),
+                ..lsp::WorkspaceEditCapabilities::new(),
+            },
+        ),
+    );
+    testing::assert_err(contradictory.for_client(lsp::WorkspaceEditCapabilities::new()));
+    let versioned = lsp::WorkspaceEdit {
+        changes: Option::Some(Vec::from_array([("a", Vec::new())])),
+        ..workspace_wrap(workspace_document("a", Option::Some(2), Vec::new())),
+    };
+    testing::assert_err(versioned.for_client(lsp::WorkspaceEditCapabilities::new()));
+}
+
+#[test]
+fn workspace_legacy_fallback_compares_edit_text_ranges_and_order() -> () {
+    let first = workspace_text(0, 0, "first");
+    let second = workspace_text(0, 0, "second");
+    let doc = workspace_document("a", Option::None, Vec::from_array([first, second]));
+    for edits in[
+        Vec::from_array([second, first]),
+        Vec::from_array([first]),
+        Vec::from_array([first, workspace_text(1, 1, "second")]),
+        Vec::from_array([first, workspace_text(0, 0, "different")]),
+    ] {
+        let dual = lsp::WorkspaceEdit {
+            changes: Option::Some(Vec::from_array([("a", edits)])),
+            ..workspace_wrap(doc),
+        };
+        testing::assert_err(dual.for_client(lsp::WorkspaceEditCapabilities::new()));
+    }
+}

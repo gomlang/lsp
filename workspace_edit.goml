@@ -1,0 +1,1009 @@
+package lsp;
+
+use std::json;
+
+fn workspace_bool(value: json::Value, key: string) -> Result[Option[bool], RpcError] {
+    match json::field(value, key) {
+        None => Result::Ok(Option::None),
+        Some(json::Value::Bool(flag)) => Result::Ok(Option::Some(flag)),
+        _ => Result::Err(invalid(f"{key} must be a boolean")),
+    }
+}
+
+fn workspace_string(value: json::Value, key: string) -> Result[Option[string], RpcError] {
+    match json::field(value, key) {
+        None => Result::Ok(Option::None),
+        Some(json::Value::String(text)) => Result::Ok(Option::Some(text)),
+        _ => Result::Err(invalid(f"{key} must be a string")),
+    }
+}
+
+fn workspace_put_bool(fields: Vec[(string, json::Value)], key: string, flag: Option[bool]) -> () {
+    if let Some(flag) = flag {
+        fields.push((key, json::Value::Bool(flag)));
+    }
+}
+
+fn workspace_put_string(fields: Vec[(string, json::Value)], key: string, value: Option[string]) -> () {
+    if let Some(value) = value {
+        fields.push((key, json::Value::String(value)));
+    }
+}
+
+fn workspace_uri(uri: string) -> Result[(), RpcError] {
+    if uri == "" {
+        Result::Err(invalid("document URI must not be empty"))
+    } else {
+        Result::Ok(())
+    }
+}
+
+fn workspace_ranges(edits: Vec[TextEdit]) -> Result[(), RpcError] {
+    let ordered: Vec[(Range, isize)] = Vec::new();
+    for index in 0..edits.len() {
+        let range = Range::from_json(edits[index].range.to_json())?;
+        ordered.push((range, index));
+    }
+    ordered.sort_by(
+        |left, right| {
+            if before(left.0.start, right.0.start) {
+                -1
+            } else if before(right.0.start, left.0.start) {
+                1
+            } else {
+                left.1 - right.1
+            }
+        },
+    );
+    let mut previous = Option::None;
+    for (range, _) in ordered {
+        if let Some(end) = previous {
+            if before(range.start, end) {
+                return Result::Err(invalid("overlapping text edits"))
+            }
+        }
+        previous = Option::Some(range.end);
+    }
+    Result::Ok(())
+}
+
+pub struct AnnotatedTextEdit {
+    pub range: Range,
+    pub new_text: string,
+    pub annotation_id: string,
+}
+
+impl AnnotatedTextEdit {
+    pub fn from_json(value: json::Value) -> Result[AnnotatedTextEdit, RpcError] {
+        let edit = TextEdit::from_json(value)?;
+        Result::Ok(
+            AnnotatedTextEdit {
+                range: edit.range,
+                new_text: edit.new_text,
+                annotation_id: string_field(value, "annotationId")?,
+            },
+        )
+    }
+
+    pub fn to_json(self: AnnotatedTextEdit) -> Result[json::Value, RpcError] {
+        let _ = Range::from_json(self.range.to_json())?;
+        Result::Ok(
+            json::object(
+                Vec::from_array(
+                    [
+                        ("range", self.range.to_json()),
+                        ("newText", json::Value::String(self.new_text)),
+                        ("annotationId", json::Value::String(self.annotation_id)),
+                    ],
+                ),
+            ),
+        )
+    }
+}
+
+pub enum DocumentTextEdit {
+    Plain(TextEdit),
+    Annotated(AnnotatedTextEdit),
+}
+
+impl DocumentTextEdit {
+    pub fn from_json(value: json::Value) -> Result[DocumentTextEdit, RpcError] {
+        if json::field(value, "annotationId").is_some() {
+            Result::Ok(DocumentTextEdit::Annotated(AnnotatedTextEdit::from_json(value)?))
+        } else {
+            Result::Ok(DocumentTextEdit::Plain(TextEdit::from_json(value)?))
+        }
+    }
+
+    pub fn to_json(self: DocumentTextEdit) -> Result[json::Value, RpcError] {
+        match self {
+            Plain(edit) => {
+                let _ = Range::from_json(edit.range.to_json())?;
+                Result::Ok(edit.to_json())
+            },
+            Annotated(edit) => edit.to_json(),
+        }
+    }
+
+    pub fn text_edit(self: DocumentTextEdit) -> TextEdit {
+        match self {
+            Plain(edit) => edit,
+            Annotated(edit) => TextEdit { range: edit.range, new_text: edit.new_text },
+        }
+    }
+}
+
+pub struct TextDocumentEdit {
+    pub uri: string,
+    pub version: Option[isize],
+    pub edits: Vec[DocumentTextEdit],
+}
+
+impl TextDocumentEdit {
+    pub fn from_json(value: json::Value) -> Result[TextDocumentEdit, RpcError] {
+        let _ = members(value)?;
+        let document = required(value, "textDocument")?;
+        let _ = members(document)?;
+        let version = match required(document, "version")? {
+            json::Value::Null => Option::None,
+            value => Option::Some(integer(value)?),
+        };
+        let edits = Vec::new();
+        for edit in json::as_array(required(value, "edits")?).ok_or(
+            invalid("edits must be an array"),
+        )? {
+            edits.push(DocumentTextEdit::from_json(edit)?);
+        }
+        let result = TextDocumentEdit { uri: string_field(document, "uri")?, version, edits };
+        result.validate()?;
+        Result::Ok(result)
+    }
+
+    pub fn validate(self: TextDocumentEdit) -> Result[(), RpcError] {
+        workspace_uri(self.uri)?;
+        if let Some(version) = self.version {
+            let _ = integer(json::Value::Number(version.to_string()))?;
+        }
+        let edits = Vec::new();
+        for edit in self.edits {
+            edits.push(edit.text_edit());
+        }
+        workspace_ranges(edits)
+    }
+
+    pub fn validate_document(self: TextDocumentEdit, document: Document) -> Result[(), RpcError] {
+        self.validate()?;
+        if self.uri != document.uri() {
+            return Result::Err(invalid("edit URI does not match document"))
+        }
+        if let Some(version) = self.version {
+            if version != document.version() {
+                return Result::Err(invalid("edit version does not match document"))
+            }
+        }
+        let spans: Vec[(isize, isize, isize)] = Vec::new();
+        for index in 0..self.edits.len() {
+            let (start, end) = document.offsets(self.edits[index].text_edit().range)?;
+            spans.push((start, end, index));
+        }
+        spans.sort_by(
+            |left, right| if left.0 == right.0 {
+                left.2 - right.2
+            } else {
+                left.0 - right.0
+            },
+        );
+        let mut cursor = 0;
+        for (start, end, _) in spans {
+            if start < cursor {
+                return Result::Err(invalid("overlapping text edits after position clamping"))
+            }
+            cursor = end;
+        }
+        Result::Ok(())
+    }
+
+    pub fn to_json(self: TextDocumentEdit) -> Result[json::Value, RpcError] {
+        self.validate()?;
+        let edits = Vec::new();
+        for edit in self.edits {
+            edits.push(edit.to_json()?);
+        }
+        Result::Ok(
+            json::object(
+                Vec::from_array(
+                    [
+                        (
+                            "textDocument",
+                            json::object(
+                                Vec::from_array(
+                                    [
+                                        ("uri", json::Value::String(self.uri)),
+                                        (
+                                            "version",
+                                            self.version.map(
+                                                |version| json::Value::Number(version.to_string()),
+                                            ).unwrap_or(json::Value::Null),
+                                        ),
+                                    ],
+                                ),
+                            ),
+                        ),
+                        ("edits", json::Value::Array(edits)),
+                    ],
+                ),
+            ),
+        )
+    }
+}
+
+pub struct ChangeAnnotation {
+    pub label: string,
+    pub needs_confirmation: Option[bool],
+    pub description: Option[string],
+}
+
+impl ChangeAnnotation {
+    pub fn from_json(value: json::Value) -> Result[ChangeAnnotation, RpcError] {
+        let _ = members(value)?;
+        Result::Ok(
+            ChangeAnnotation {
+                label: string_field(value, "label")?,
+                needs_confirmation: workspace_bool(value, "needsConfirmation")?,
+                description: workspace_string(value, "description")?,
+            },
+        )
+    }
+
+    pub fn to_json(self: ChangeAnnotation) -> json::Value {
+        let fields = Vec::from_array([("label", json::Value::String(self.label))]);
+        workspace_put_bool(fields, "needsConfirmation", self.needs_confirmation);
+        workspace_put_string(fields, "description", self.description);
+        json::object(fields)
+    }
+}
+
+pub struct CreateFileOptions {
+    pub overwrite: Option[bool],
+    pub ignore_if_exists: Option[bool],
+}
+
+impl CreateFileOptions {
+    pub fn new() -> CreateFileOptions {
+        CreateFileOptions { overwrite: Option::None, ignore_if_exists: Option::None }
+    }
+
+    pub fn from_json(value: json::Value) -> Result[CreateFileOptions, RpcError] {
+        let _ = members(value)?;
+        Result::Ok(
+            CreateFileOptions {
+                overwrite: workspace_bool(value, "overwrite")?,
+                ignore_if_exists: workspace_bool(value, "ignoreIfExists")?,
+            },
+        )
+    }
+
+    pub fn to_json(self: CreateFileOptions) -> json::Value {
+        let fields = Vec::new();
+        workspace_put_bool(fields, "overwrite", self.overwrite);
+        workspace_put_bool(fields, "ignoreIfExists", self.ignore_if_exists);
+        json::object(fields)
+    }
+}
+
+pub struct RenameFileOptions {
+    pub overwrite: Option[bool],
+    pub ignore_if_exists: Option[bool],
+}
+
+impl RenameFileOptions {
+    pub fn new() -> RenameFileOptions {
+        RenameFileOptions { overwrite: Option::None, ignore_if_exists: Option::None }
+    }
+
+    pub fn from_json(value: json::Value) -> Result[RenameFileOptions, RpcError] {
+        let _ = members(value)?;
+        Result::Ok(
+            RenameFileOptions {
+                overwrite: workspace_bool(value, "overwrite")?,
+                ignore_if_exists: workspace_bool(value, "ignoreIfExists")?,
+            },
+        )
+    }
+
+    pub fn to_json(self: RenameFileOptions) -> json::Value {
+        let fields = Vec::new();
+        workspace_put_bool(fields, "overwrite", self.overwrite);
+        workspace_put_bool(fields, "ignoreIfExists", self.ignore_if_exists);
+        json::object(fields)
+    }
+}
+
+pub struct DeleteFileOptions {
+    pub recursive: Option[bool],
+    pub ignore_if_not_exists: Option[bool],
+}
+
+impl DeleteFileOptions {
+    pub fn new() -> DeleteFileOptions {
+        DeleteFileOptions { recursive: Option::None, ignore_if_not_exists: Option::None }
+    }
+
+    pub fn from_json(value: json::Value) -> Result[DeleteFileOptions, RpcError] {
+        let _ = members(value)?;
+        Result::Ok(
+            DeleteFileOptions {
+                recursive: workspace_bool(value, "recursive")?,
+                ignore_if_not_exists: workspace_bool(value, "ignoreIfNotExists")?,
+            },
+        )
+    }
+
+    pub fn to_json(self: DeleteFileOptions) -> json::Value {
+        let fields = Vec::new();
+        workspace_put_bool(fields, "recursive", self.recursive);
+        workspace_put_bool(fields, "ignoreIfNotExists", self.ignore_if_not_exists);
+        json::object(fields)
+    }
+}
+
+pub struct CreateFile {
+    pub uri: string,
+    pub options: Option[CreateFileOptions],
+    pub annotation_id: Option[string],
+}
+
+impl CreateFile {
+    pub fn from_json(value: json::Value) -> Result[CreateFile, RpcError] {
+        let _ = members(value)?;
+        if string_field(value, "kind")? != "create" {
+            return Result::Err(invalid("unexpected resource operation kind"))
+        }
+        let options = match json::field(value, "options") {
+            Some(value) => Option::Some(CreateFileOptions::from_json(value)?),
+            None => Option::None,
+        };
+        let result = CreateFile {
+            uri: string_field(value, "uri")?,
+            options,
+            annotation_id: workspace_string(value, "annotationId")?,
+        };
+        let _ = result.to_json()?;
+        Result::Ok(result)
+    }
+
+    pub fn to_json(self: CreateFile) -> Result[json::Value, RpcError] {
+        workspace_uri(self.uri)?;
+        let fields = Vec::from_array(
+            [("kind", json::Value::String("create")), ("uri", json::Value::String(self.uri))],
+        );
+        if let Some(options) = self.options {
+            fields.push(("options", options.to_json()));
+        }
+        workspace_put_string(fields, "annotationId", self.annotation_id);
+        Result::Ok(json::object(fields))
+    }
+}
+
+pub struct RenameFile {
+    pub old_uri: string,
+    pub new_uri: string,
+    pub options: Option[RenameFileOptions],
+    pub annotation_id: Option[string],
+}
+
+impl RenameFile {
+    pub fn from_json(value: json::Value) -> Result[RenameFile, RpcError] {
+        let _ = members(value)?;
+        if string_field(value, "kind")? != "rename" {
+            return Result::Err(invalid("unexpected resource operation kind"))
+        }
+        let options = match json::field(value, "options") {
+            Some(value) => Option::Some(RenameFileOptions::from_json(value)?),
+            None => Option::None,
+        };
+        let result = RenameFile {
+            old_uri: string_field(value, "oldUri")?,
+            new_uri: string_field(value, "newUri")?,
+            options,
+            annotation_id: workspace_string(value, "annotationId")?,
+        };
+        let _ = result.to_json()?;
+        Result::Ok(result)
+    }
+
+    pub fn to_json(self: RenameFile) -> Result[json::Value, RpcError] {
+        workspace_uri(self.old_uri)?;
+        workspace_uri(self.new_uri)?;
+        let fields = Vec::from_array(
+            [
+                ("kind", json::Value::String("rename")),
+                ("oldUri", json::Value::String(self.old_uri)),
+                ("newUri", json::Value::String(self.new_uri)),
+            ],
+        );
+        if let Some(options) = self.options {
+            fields.push(("options", options.to_json()));
+        }
+        workspace_put_string(fields, "annotationId", self.annotation_id);
+        Result::Ok(json::object(fields))
+    }
+}
+
+pub struct DeleteFile {
+    pub uri: string,
+    pub options: Option[DeleteFileOptions],
+    pub annotation_id: Option[string],
+}
+
+impl DeleteFile {
+    pub fn from_json(value: json::Value) -> Result[DeleteFile, RpcError] {
+        let _ = members(value)?;
+        if string_field(value, "kind")? != "delete" {
+            return Result::Err(invalid("unexpected resource operation kind"))
+        }
+        let options = match json::field(value, "options") {
+            Some(value) => Option::Some(DeleteFileOptions::from_json(value)?),
+            None => Option::None,
+        };
+        let result = DeleteFile {
+            uri: string_field(value, "uri")?,
+            options,
+            annotation_id: workspace_string(value, "annotationId")?,
+        };
+        let _ = result.to_json()?;
+        Result::Ok(result)
+    }
+
+    pub fn to_json(self: DeleteFile) -> Result[json::Value, RpcError] {
+        workspace_uri(self.uri)?;
+        let fields = Vec::from_array(
+            [("kind", json::Value::String("delete")), ("uri", json::Value::String(self.uri))],
+        );
+        if let Some(options) = self.options {
+            fields.push(("options", options.to_json()));
+        }
+        workspace_put_string(fields, "annotationId", self.annotation_id);
+        Result::Ok(json::object(fields))
+    }
+}
+
+pub enum DocumentChange {
+    Edit(TextDocumentEdit),
+    Create(CreateFile),
+    Rename(RenameFile),
+    Delete(DeleteFile),
+}
+
+impl DocumentChange {
+    pub fn from_json(value: json::Value) -> Result[DocumentChange, RpcError] {
+        if let Some(kind) = json::field(value, "kind") {
+            match kind {
+                json::Value::String("create") => Result::Ok(
+                    DocumentChange::Create(CreateFile::from_json(value)?),
+                ),
+                json::Value::String("rename") => Result::Ok(
+                    DocumentChange::Rename(RenameFile::from_json(value)?),
+                ),
+                json::Value::String("delete") => Result::Ok(
+                    DocumentChange::Delete(DeleteFile::from_json(value)?),
+                ),
+                _ => Result::Err(invalid("unknown resource operation kind")),
+            }
+        } else {
+            Result::Ok(DocumentChange::Edit(TextDocumentEdit::from_json(value)?))
+        }
+    }
+
+    pub fn to_json(self: DocumentChange) -> Result[json::Value, RpcError] {
+        match self {
+            Edit(edit) => edit.to_json(),
+            Create(edit) => edit.to_json(),
+            Rename(edit) => edit.to_json(),
+            Delete(edit) => edit.to_json(),
+        }
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum ResourceOperationKind {
+    Create,
+    Rename,
+    Delete,
+}
+
+impl ResourceOperationKind {
+    pub fn from_json(value: json::Value) -> Result[ResourceOperationKind, RpcError] {
+        match value {
+            json::Value::String("create") => Result::Ok(ResourceOperationKind::Create),
+            json::Value::String("rename") => Result::Ok(ResourceOperationKind::Rename),
+            json::Value::String("delete") => Result::Ok(ResourceOperationKind::Delete),
+            _ => Result::Err(invalid("unknown resource operation capability")),
+        }
+    }
+
+    pub fn to_json(self: ResourceOperationKind) -> json::Value {
+        json::Value::String(
+            match self {
+                Create => "create",
+                Rename => "rename",
+                Delete => "delete",
+            },
+        )
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum FailureHandlingKind {
+    Abort,
+    Transactional,
+    TextOnlyTransactional,
+    Undo,
+}
+
+impl FailureHandlingKind {
+    pub fn from_json(value: json::Value) -> Result[FailureHandlingKind, RpcError] {
+        match value {
+            json::Value::String("abort") => Result::Ok(FailureHandlingKind::Abort),
+            json::Value::String("transactional") => Result::Ok(FailureHandlingKind::Transactional),
+            json::Value::String("textOnlyTransactional") => Result::Ok(
+                FailureHandlingKind::TextOnlyTransactional,
+            ),
+            json::Value::String("undo") => Result::Ok(FailureHandlingKind::Undo),
+            _ => Result::Err(invalid("unknown workspace failure handling capability")),
+        }
+    }
+
+    pub fn to_json(self: FailureHandlingKind) -> json::Value {
+        json::Value::String(
+            match self {
+                Abort => "abort",
+                Transactional => "transactional",
+                TextOnlyTransactional => "textOnlyTransactional",
+                Undo => "undo",
+            },
+        )
+    }
+}
+
+pub struct ChangeAnnotationSupport {
+    pub groups_on_label: Option[bool],
+}
+
+pub struct WorkspaceEditCapabilities {
+    pub document_changes: Option[bool],
+    pub resource_operations: Option[Vec[ResourceOperationKind]],
+    pub failure_handling: Option[FailureHandlingKind],
+    pub normalizes_line_endings: Option[bool],
+    pub change_annotation_support: Option[ChangeAnnotationSupport],
+}
+
+impl WorkspaceEditCapabilities {
+    pub fn new() -> WorkspaceEditCapabilities {
+        WorkspaceEditCapabilities {
+            document_changes: Option::None,
+            resource_operations: Option::None,
+            failure_handling: Option::None,
+            normalizes_line_endings: Option::None,
+            change_annotation_support: Option::None,
+        }
+    }
+
+    pub fn from_json(value: json::Value) -> Result[WorkspaceEditCapabilities, RpcError] {
+        let _ = members(value)?;
+        let operations = match json::field(value, "resourceOperations") {
+            None => Option::None,
+            Some(value) => {
+                let operations = Vec::new();
+                for operation in json::as_array(value).ok_or(
+                    invalid("resourceOperations must be an array"),
+                )? {
+                    operations.push(ResourceOperationKind::from_json(operation)?);
+                }
+                Option::Some(operations)
+            },
+        };
+        let failure = match json::field(value, "failureHandling") {
+            None => Option::None,
+            Some(value) => Option::Some(FailureHandlingKind::from_json(value)?),
+        };
+        let annotations = match json::field(value, "changeAnnotationSupport") {
+            None => Option::None,
+            Some(value) => {
+                let _ = members(value)?;
+                Option::Some(
+                    ChangeAnnotationSupport {
+                        groups_on_label: workspace_bool(value, "groupsOnLabel")?,
+                    },
+                )
+            },
+        };
+        Result::Ok(
+            WorkspaceEditCapabilities {
+                document_changes: workspace_bool(value, "documentChanges")?,
+                resource_operations: operations,
+                failure_handling: failure,
+                normalizes_line_endings: workspace_bool(value, "normalizesLineEndings")?,
+                change_annotation_support: annotations,
+            },
+        )
+    }
+
+    pub fn from_client_capabilities(value: json::Value) -> Result[
+        WorkspaceEditCapabilities,
+        RpcError,
+    ] {
+        let _ = members(value)?;
+        let Some(workspace) = json::field(value, "workspace") else {
+            return Result::Ok(WorkspaceEditCapabilities::new())
+        };
+        let _ = members(workspace)?;
+        match json::field(workspace, "workspaceEdit") {
+            None => Result::Ok(WorkspaceEditCapabilities::new()),
+            Some(value) => WorkspaceEditCapabilities::from_json(value),
+        }
+    }
+
+    pub fn to_json(self: WorkspaceEditCapabilities) -> json::Value {
+        let fields = Vec::new();
+        workspace_put_bool(fields, "documentChanges", self.document_changes);
+        if let Some(operations) = self.resource_operations {
+            let values = Vec::new();
+            for operation in operations {
+                values.push(operation.to_json());
+            }
+            fields.push(("resourceOperations", json::Value::Array(values)));
+        }
+        if let Some(failure) = self.failure_handling {
+            fields.push(("failureHandling", failure.to_json()));
+        }
+        workspace_put_bool(fields, "normalizesLineEndings", self.normalizes_line_endings);
+        if let Some(support) = self.change_annotation_support {
+            let annotation_fields = Vec::new();
+            workspace_put_bool(annotation_fields, "groupsOnLabel", support.groups_on_label);
+            fields.push(("changeAnnotationSupport", json::object(annotation_fields)));
+        }
+        json::object(fields)
+    }
+
+    pub fn supports_resource(self: WorkspaceEditCapabilities, kind: ResourceOperationKind) -> bool {
+        if let Some(operations) = self.resource_operations {
+            for operation in operations {
+                if operation == kind {
+                    return true
+                }
+            }
+        }
+        false
+    }
+}
+
+pub struct WorkspaceEdit {
+    pub changes: Option[Vec[(string, Vec[TextEdit])]],
+    pub document_changes: Option[Vec[DocumentChange]],
+    pub change_annotations: Option[Vec[(string, ChangeAnnotation)]],
+}
+
+impl WorkspaceEdit {
+    pub fn new() -> WorkspaceEdit {
+        WorkspaceEdit {
+            changes: Option::None,
+            document_changes: Option::None,
+            change_annotations: Option::None,
+        }
+    }
+
+    pub fn from_json(value: json::Value) -> Result[WorkspaceEdit, RpcError] {
+        let _ = members(value)?;
+        let changes = match json::field(value, "changes") {
+            None => Option::None,
+            Some(value) => {
+                let changes = Vec::new();
+                for (uri, values) in members(value)? {
+                    let edits = Vec::new();
+                    for edit in json::as_array(values).ok_or(
+                        invalid("changes entries must be arrays"),
+                    )? {
+                        if json::field(edit, "annotationId").is_some() {
+                            return Result::Err(invalid("annotated edits require documentChanges"))
+                        }
+                        edits.push(TextEdit::from_json(edit)?);
+                    }
+                    changes.push((uri, edits));
+                }
+                Option::Some(changes)
+            },
+        };
+        let documents = match json::field(value, "documentChanges") {
+            None => Option::None,
+            Some(value) => {
+                let documents = Vec::new();
+                for change in json::as_array(value).ok_or(
+                    invalid("documentChanges must be an array"),
+                )? {
+                    documents.push(DocumentChange::from_json(change)?);
+                }
+                Option::Some(documents)
+            },
+        };
+        let annotations = match json::field(value, "changeAnnotations") {
+            None => Option::None,
+            Some(value) => {
+                let annotations = Vec::new();
+                for (id, annotation) in members(value)? {
+                    annotations.push((id, ChangeAnnotation::from_json(annotation)?));
+                }
+                Option::Some(annotations)
+            },
+        };
+        let result = WorkspaceEdit {
+            changes,
+            document_changes: documents,
+            change_annotations: annotations,
+        };
+        result.validate()?;
+        Result::Ok(result)
+    }
+
+    pub fn validate(self: WorkspaceEdit) -> Result[(), RpcError] {
+        let annotations: HashMap[string, bool] = HashMap::new();
+        if let Some(values) = self.change_annotations {
+            for (id, _) in values {
+                if annotations.contains(id) {
+                    return Result::Err(invalid("duplicate change annotation"))
+                }
+                annotations.set(id, true);
+            }
+        }
+        if let Some(changes) = self.changes {
+            let seen: HashMap[string, bool] = HashMap::new();
+            for (uri, edits) in changes {
+                workspace_uri(uri)?;
+                if seen.contains(uri) {
+                    return Result::Err(invalid("duplicate changes URI"))
+                }
+                seen.set(uri, true);
+                workspace_ranges(edits)?;
+            }
+        }
+        if let Some(changes) = self.document_changes {
+            for change in changes {
+                let annotation = match change {
+                    Edit(edit) => {
+                        edit.validate()?;
+                        for item in edit.edits {
+                            if let DocumentTextEdit::Annotated(item) = item {
+                                workspace_annotation(Option::Some(item.annotation_id), annotations)?;
+                            }
+                        }
+                        Option::None
+                    },
+                    Create(edit) => {
+                        let _ = edit.to_json()?;
+                        edit.annotation_id
+                    },
+                    Rename(edit) => {
+                        let _ = edit.to_json()?;
+                        edit.annotation_id
+                    },
+                    Delete(edit) => {
+                        let _ = edit.to_json()?;
+                        edit.annotation_id
+                    },
+                };
+                workspace_annotation(annotation, annotations)?;
+            }
+        }
+        Result::Ok(())
+    }
+
+    pub fn to_json(self: WorkspaceEdit) -> Result[json::Value, RpcError] {
+        self.validate()?;
+        let fields = Vec::new();
+        if let Some(changes) = self.changes {
+            let entries = Vec::new();
+            for (uri, edits) in changes {
+                let values = Vec::new();
+                for edit in edits {
+                    values.push(edit.to_json());
+                }
+                entries.push((uri, json::Value::Array(values)));
+            }
+            fields.push(("changes", json::object(entries)));
+        }
+        if let Some(changes) = self.document_changes {
+            let values = Vec::new();
+            for change in changes {
+                values.push(change.to_json()?);
+            }
+            fields.push(("documentChanges", json::Value::Array(values)));
+        }
+        if let Some(annotations) = self.change_annotations {
+            let values = Vec::new();
+            for (id, annotation) in annotations {
+                values.push((id, annotation.to_json()));
+            }
+            fields.push(("changeAnnotations", json::object(values)));
+        }
+        Result::Ok(json::object(fields))
+    }
+
+    pub fn for_client(self: WorkspaceEdit, capabilities: WorkspaceEditCapabilities) -> Result[
+        WorkspaceEdit,
+        RpcError,
+    ] {
+        self.validate()?;
+        if let Some(annotations) = self.change_annotations {
+            if annotations.len() > 0 && capabilities.change_annotation_support.is_none() {
+                return Result::Err(invalid("client does not support change annotations"))
+            }
+        }
+        let Some(changes) = self.document_changes else {
+            return Result::Ok(self)
+        };
+        let versioned = capabilities.document_changes.unwrap_or(false);
+        let resource_capable = capabilities.resource_operations.map(
+            |operations| operations.len() > 0,
+        ).unwrap_or(false);
+        if versioned || resource_capable {
+            for change in changes {
+                let kind = match change {
+                    Edit(edit) => {
+                        if edit.version.is_some() && !versioned {
+                            return Result::Err(invalid("client does not support document versions"))
+                        }
+                        Option::None
+                    },
+                    Create(_) => Option::Some(ResourceOperationKind::Create),
+                    Rename(_) => Option::Some(ResourceOperationKind::Rename),
+                    Delete(_) => Option::Some(ResourceOperationKind::Delete),
+                };
+                if let Some(kind) = kind {
+                    if !capabilities.supports_resource(kind) {
+                        return Result::Err(
+                            invalid("client does not support this resource operation"),
+                        )
+                    }
+                }
+            }
+            return Result::Ok(WorkspaceEdit { changes: Option::None, ..self })
+        }
+        let legacy = Vec::new();
+        let seen: HashMap[string, bool] = HashMap::new();
+        for change in changes {
+            let DocumentChange::Edit(edit) = change else {
+                return Result::Err(invalid("client does not support resource documentChanges"))
+            };
+            if edit.version.is_some() {
+                return Result::Err(invalid("cannot discard document version for legacy client"))
+            }
+            if seen.contains(edit.uri) {
+                return Result::Err(invalid("cannot merge sequential edits for legacy client"))
+            }
+            seen.set(edit.uri, true);
+            let edits = Vec::new();
+            for item in edit.edits {
+                let DocumentTextEdit::Plain(item) = item else {
+                    return Result::Err(invalid("cannot discard edit annotations for legacy client"))
+                };
+                edits.push(item);
+            }
+            legacy.push((edit.uri, edits));
+        }
+        if let Some(fallback) = self.changes {
+            workspace_fallback(fallback, legacy)?;
+        }
+        Result::Ok(
+            WorkspaceEdit { changes: Option::Some(legacy), document_changes: Option::None, ..self },
+        )
+    }
+
+    pub fn to_json_for(self: WorkspaceEdit, capabilities: WorkspaceEditCapabilities) -> Result[
+        json::Value,
+        RpcError,
+    ] {
+        self.for_client(capabilities)?.to_json()
+    }
+}
+
+fn workspace_annotation(id: Option[string], annotations: HashMap[string, bool]) -> Result[
+    (),
+    RpcError,
+] {
+    if let Some(id) = id {
+        if !annotations.contains(id) {
+            return Result::Err(invalid("unknown change annotation reference"))
+        }
+    }
+    Result::Ok(())
+}
+
+pub struct ApplyWorkspaceEditParams {
+    pub label: Option[string],
+    pub edit: WorkspaceEdit,
+}
+
+impl ApplyWorkspaceEditParams {
+    pub fn from_json(value: json::Value) -> Result[ApplyWorkspaceEditParams, RpcError] {
+        let _ = members(value)?;
+        Result::Ok(
+            ApplyWorkspaceEditParams {
+                label: workspace_string(value, "label")?,
+                edit: WorkspaceEdit::from_json(required(value, "edit")?)?,
+            },
+        )
+    }
+
+    pub fn to_json(self: ApplyWorkspaceEditParams) -> Result[json::Value, RpcError] {
+        let fields = Vec::from_array([("edit", self.edit.to_json()?)]);
+        workspace_put_string(fields, "label", self.label);
+        Result::Ok(json::object(fields))
+    }
+
+    pub fn to_json_for(self: ApplyWorkspaceEditParams, capabilities: WorkspaceEditCapabilities) -> Result[
+        json::Value,
+        RpcError,
+    ] {
+        ApplyWorkspaceEditParams { edit: self.edit.for_client(capabilities)?, ..self }.to_json()
+    }
+}
+
+pub struct ApplyWorkspaceEditResult {
+    pub applied: bool,
+    pub failure_reason: Option[string],
+    pub failed_change: Option[isize],
+}
+
+impl ApplyWorkspaceEditResult {
+    pub fn from_json(value: json::Value) -> Result[ApplyWorkspaceEditResult, RpcError] {
+        let _ = members(value)?;
+        let applied = workspace_bool(value, "applied")?.ok_or(invalid("missing applied"))?;
+        let failed_change = match json::field(value, "failedChange") {
+            None => Option::None,
+            Some(value) => Option::Some(unsigned(value)?),
+        };
+        Result::Ok(
+            ApplyWorkspaceEditResult {
+                applied,
+                failure_reason: workspace_string(value, "failureReason")?,
+                failed_change,
+            },
+        )
+    }
+
+    pub fn to_json(self: ApplyWorkspaceEditResult) -> Result[json::Value, RpcError] {
+        let fields = Vec::from_array([("applied", json::Value::Bool(self.applied))]);
+        workspace_put_string(fields, "failureReason", self.failure_reason);
+        if let Some(index) = self.failed_change {
+            let _ = unsigned(json::Value::Number(index.to_string()))?;
+            fields.push(("failedChange", json::Value::Number(index.to_string())));
+        }
+        Result::Ok(json::object(fields))
+    }
+}
+
+fn workspace_fallback(provided: Vec[(string, Vec[TextEdit])], derived: Vec[(string, Vec[TextEdit])]) -> Result[
+    (),
+    RpcError,
+] {
+    if provided.len() != derived.len() {
+        return Result::Err(invalid("conflicting legacy fallback"))
+    }
+    let by_uri: HashMap[string, Vec[TextEdit]] = HashMap::new();
+    for (uri, edits) in provided {
+        by_uri.set(uri, edits);
+    }
+    for (uri, edits) in derived {
+        let fallback = by_uri.get(uri).ok_or(invalid("conflicting legacy fallback"))?;
+        if fallback.len() != edits.len() {
+            return Result::Err(invalid("conflicting legacy fallback"))
+        }
+        for index in 0..edits.len() {
+            if edits[index].range != fallback[index].range
+                || edits[index].new_text != fallback[index].new_text {
+                return Result::Err(invalid("conflicting legacy fallback"))
+            }
+        }
+    }
+    Result::Ok(())
+}

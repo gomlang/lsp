@@ -20,6 +20,8 @@ coverage of every optional LSP feature or generated protocol type.
 | Documents | `PositionEncoding`, `Position`, `Range`, `TextEdit`, `Change`, `Document`, `Documents`, `utf16_length` |
 | Requests | `Session`, `RequestToken`, `Completed`, `ExpiredRequest` |
 | Dispatch | `RequestContext`, `Router`, `Server`, `Phase`, `Event`, `Dispatch`, `PendingRequest` |
+| Initialization | `InitializeParams`, `InitializeResult`, `PeerInfo`, `WorkspaceFolder`, `Server.on_initialize`, `Server.initialization` |
+| Workspace edits | `WorkspaceEdit`, `TextDocumentEdit`, `DocumentTextEdit`, `DocumentChange`, `WorkspaceEditCapabilities`, `ApplyWorkspaceEditParams`, `ApplyWorkspaceEditResult` |
 | Feature helpers | `DocumentPosition`, `Location`, `Diagnostic`, `publish_diagnostics`, `hover`, `progress`, `CompletionItem`, `CompletionList` |
 | Standard I/O | `Stdio::new`, `read_body`, `write` |
 
@@ -112,6 +114,56 @@ the batch reduce the retained length. Negative limits fail, and an empty batch
 still checks the snapshot size. The original `apply_edits` retains its unrestricted
 output behavior with the same complete preflight validation.
 
+## Workspace edit models
+
+`WorkspaceEdit` provides checked `from_json` / `to_json` conversions for `changes`,
+ordered `documentChanges` and `changeAnnotations`. It supports `TextDocumentEdit`,
+plain and annotated text edits, and `CreateFile`, `RenameFile` and `DeleteFile`
+operations with their optional flags. Absent fields, empty collections, explicit
+false values and a null document version retain their wire meanings. Both edit
+representations may be retained when reading or serializing a protocol value.
+
+Validation checks nonempty URIs, signed 32-bit document versions, ordered ranges,
+non-overlapping edits, duplicate URI/annotation map entries and annotation
+references. Multiple insertions at the same position keep their supplied order;
+insertions may precede one replacement at that position. Resource operations and
+successive document edits retain their input order. `TextDocumentEdit.version`
+is `Option[isize]`: `None` serializes to the required `version: null`, and a missing
+version in parsed JSON is rejected.
+
+`TextDocumentEdit.validate_document(snapshot)` additionally checks URI, version
+and coordinates against a specific `Document`. It uses that snapshot's negotiated
+UTF-8/16/32 encoding, rejects invalid scalar/surrogate boundaries and rechecks
+overlap after line-end clamping. It does not mutate the document or materialize
+replacement text. Validation of one snapshot does not simulate the file state
+after a sequence of create/rename/delete operations.
+
+`WorkspaceEditCapabilities::from_client_capabilities(params.capabilities)` reads
+the full client capability object; `from_json` instead reads its nested
+`workspace.workspaceEdit` object. `edit.to_json_for(capabilities)` and
+`edit.for_client(capabilities)` check support for versioned documents, each
+resource operation and change annotations. Resource-operation support is
+independent of support for non-null document versions.
+
+For a capable client, the checked adapter selects `documentChanges` when present.
+For a legacy client it can convert only unversioned, unannotated text edits with
+distinct URIs into `changes`. It rejects conversions that would discard version
+constraints, annotation references, resource operations or sequential edits.
+When both representations are supplied, legacy conversion also requires that the
+provided `changes` match the derived edits; conflicting fallback content is an
+error. Applications choosing a different explicit fallback can construct a
+separate `WorkspaceEdit` containing that representation.
+
+`ApplyWorkspaceEditParams` builds the `workspace/applyEdit` request parameters and
+`ApplyWorkspaceEditResult` checks its `applied`, `failureReason` and `failedChange`
+response fields. Use the existing `Session.request` / `request_with_timeout` to
+send and track the request. The application must separately check
+`workspace.applyEdit` before sending it. The parsed `failure_handling` and
+`normalizes_line_endings` capabilities remain available to the application;
+these helpers do not perform filesystem/editor changes or promise transactional
+execution. The models follow the
+[LSP 3.17 workspace edit contract](https://github.com/microsoft/language-server-protocol/blob/gh-pages/_specifications/lsp/3.17/types/workspaceEdit.md).
+
 ## Completion output
 
 `CompletionItem::new(label)` starts a completion with only its required label.
@@ -149,6 +201,15 @@ automatically discard a successful or partial result: the handler decides its
 response, and every accepted request must eventually be completed.
 `Session.close` invalidates all incoming and outgoing tokens and prevents new
 registrations; it is idempotent. Server exit closes its session automatically.
+
+Incoming requests, outgoing requests, outgoing deadlines and open documents use
+shared maps that periodically rebuild after deletions. Historical insertion slots
+are bounded by twice the live entry count plus 16 after deletion; empty maps
+release their backing table immediately. Updating an existing document does not
+consume a historical slot. This prevents request IDs and document URIs from
+accumulating storage or extending deadline scans over the server's lifetime.
+Rebuilding preserves active token identity and all shared session/document handles.
+Snapshots retained by application code continue to own their document contents.
 
 Outgoing `request` registration is separate from incoming requests, so each peer
 can use the same ID independently. `receive` correlates replies and rejects
@@ -206,6 +267,57 @@ Shutdown returns null and subsequent requests fail. Exit reports status 0 after
 shutdown and 1 otherwise, leaving actual process termination to the caller.
 Caller registrations for built-in lifecycle or synchronization methods do not
 override these built-in handlers.
+
+### Initialization context and dynamic capabilities
+
+`InitializeParams::from_json` validates common initialization fields and retains
+unknown fields in a private snapshot. Public fields expose `process_id`,
+`client_info`, `locale`, `root_path`, `root_uri`, `workspace_folders`,
+`initialization_options`, `capabilities`, `trace` and `work_done_token`.
+`raw()` returns a deep copy of the original JSON, including extension fields.
+For compatibility with existing consumers, omitted `processId` and `rootUri`
+remain accepted, alongside the protocol's explicit null values.
+`workspace_folders` is `Option[Option[Vec[WorkspaceFolder]]]`: outer `None` means
+absent, `Some(None)` means null, and `Some(Some(folders))` means an array, including
+an empty array. Initialization options preserve explicit null as `Some(Null)`;
+trace defaults to `"off"` and validates `"off"`, `"messages"` or `"verbose"`.
+
+Register `Server.on_initialize` once, before initialization, to select capabilities
+from the client's advertised support. Its callback receives checked parameters
+and the negotiated `PositionEncoding`, and returns `Result[InitializeResult,
+RpcError]`. `InitializeResult::new(capabilities)` defaults `server_info` to `None`;
+set it to `Some(PeerInfo { name, version })` to include server identification.
+The callback's capabilities replace the constructor's static capabilities.
+Without a callback, the constructor's capabilities retain their existing behavior.
+The library still supplies `positionEncoding` and `textDocumentSync`; either field
+in application-provided capabilities is rejected.
+
+```goml
+server.on_initialize(|params, encoding| {
+    let _ = encoding;
+    let _ = params.root_uri;
+    // Inspect params.capabilities and initialization_options here.
+    Result::Ok(lsp::InitializeResult::new(json::object(Vec::from_array([
+        ("hoverProvider", json::Value::Bool(true)),
+    ]))))
+})?;
+```
+
+`Server.initialization()` returns `None` before a successful initialization and a
+fresh parameter snapshot afterward. Static capabilities, callback parameters,
+callback results, callback error data and saved initialization data are deeply
+copied; modifying a caller-owned JSON vector does not mutate server state or an
+already returned response. Initialization snapshots reject duplicate object fields,
+invalid numeric lexemes, depth beyond 128 and more than 1,000,000 expanded JSON
+values. Cyclic values therefore return errors rather than entering recursive
+encoding. Normal received messages also retain framing and decoder limits.
+
+Malformed parameters, failed callbacks and invalid capability results leave the
+phase, negotiated encoding and saved context unchanged, so initialization can be
+retried. Invalid callback error codes/data become InternalError (-32603), and the
+request is completed normally. Dispatch and callback registration reject reentry
+while the initialization callback runs. Application side effects inside a callback
+are the application's responsibility; the library does not roll them back.
 
 `Event` returns a reply, a correlated client response or an exit code.
 Notification/transport failures are returned to the application for local
@@ -287,6 +399,12 @@ An example test independently counts scalar byte/UTF-16/UTF-32 boundaries across
 300 generated multilingual documents, checking invalid boundaries and clamped
 positions. Deferred dispatch, outgoing deadlines, cancellation and duplicate
 suppression have direct native tests.
+
+Resource tests retain live handles while repeatedly allocating and releasing
+thousands of requests, deadlines and documents, and verify backing-map replacement.
+Initialization consumers cover nested snapshot isolation, callback failures,
+same-ID retries and reentry. Workspace edit consumers cover negotiated encodings,
+version checks, resource-operation capabilities and safe legacy conversion.
 
 Native GoML tests start the real stdio example and independently decode
 Content-Length/CRLF frames, JSON-RPC versions and response envelopes. They retain
