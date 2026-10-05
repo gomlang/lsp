@@ -51,6 +51,45 @@ fn framing_every_split_and_multibyte_chunks() -> () {
 }
 
 #[test]
+fn framing_capacity_compaction_preserves_frames_and_shared_handles() -> () {
+    let body = "é😀".repeat(40);
+    let first_wire = lsp::frame_body("first");
+    let second_wire = lsp::frame_body(body);
+    let split = second_wire.len() - 2;
+    let initial = first_wire.copy();
+    initial.extend(second_wire.slice(0, split).to_vec());
+    let stream = testing::expect_ok(
+        lsp::FrameDecoder::new(
+            lsp::FrameLimits {
+                header_bytes: 64,
+                body_bytes: body.byte_len(),
+                buffered_bytes: initial.len(),
+            },
+        ),
+        "limits",
+    );
+    let shared = stream;
+    testing::assert_ok(stream.push(initial.as_slice()));
+    let first = testing::expect_some(testing::expect_ok(shared.next(), "first frame"), "body");
+    testing::assert_none(testing::expect_ok(stream.next(), "partial second body"));
+    testing::assert_eq(shared.buffered(), body.byte_len() - 2);
+    testing::assert_eq(shared.needed(), 2);
+    // The input filled the buffer budget, but most of its bytes remain unread.
+    testing::assert_ok(shared.push(second_wire.slice(split, second_wire.len())));
+    testing::assert_eq(stream.needed(), 0);
+    testing::assert_eq(
+        testing::expect_some(testing::expect_ok(stream.next(), "completed body"), "body"),
+        body,
+    );
+    testing::assert_eq(first, "first");
+    testing::assert_none(testing::expect_ok(shared.next(), "drained"));
+    testing::assert_ok(stream.finish());
+    shared.reset();
+    testing::assert_eq(stream.buffered(), 0);
+    testing::assert_eq(first, "first");
+}
+
+#[test]
 fn framing_limits_malformed_headers_eof_and_reset() -> () {
     let invalid = Vec::from_array(
         [

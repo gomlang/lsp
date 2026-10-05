@@ -232,10 +232,13 @@ impl FrameDecoder {
         if self.start.get() > 0
             && (self.start.get() >= self.buffer.len() / 2
                 || data.len() > self.limits.buffered_bytes - self.buffer.len()) {
-            let remaining = self.buffer.slice(self.start.get(), self.buffer.len()).to_vec();
             let consumed = self.start.get();
-            self.buffer.clear();
-            self.buffer.extend(remaining);
+            let remaining = self.buffer.len() - consumed;
+            let _ = self.buffer.as_mut_slice().copy_from(
+                0,
+                self.buffer.slice(consumed, self.buffer.len()),
+            );
+            self.buffer.truncate(remaining);
             self.start.set(0);
             self.scanned.set(self.scanned.get() - consumed);
         }
