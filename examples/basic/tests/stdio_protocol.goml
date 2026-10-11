@@ -2,7 +2,6 @@ package tests;
 
 use std::bytes;
 use std::env;
-use std::fs;
 use std::json;
 use std::num;
 use std::process;
@@ -15,10 +14,9 @@ fn stdio_binary() -> string {
     if let Ok(binary) = env::var_structured("GOML_VERIFY_BINARY") {
         return binary;
     }
-    let driver = match env::var_structured("GOML_VERIFY_DRIVER") {
-        Ok(value) => value,
-        Err(_) => testing::expect_ok(fs::canonicalize("../../goml-dev/stage2/bin/goml"), "driver"),
-    };
+    let driver = env::var_structured("GOML_VERIFY_DRIVER").unwrap_or(
+        env::var_structured("GOML").unwrap_or("goml"),
+    );
     let built = testing::expect_ok(
         process::Command::new(driver).args(
             Vec::from_array(
