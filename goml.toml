@@ -2,4 +2,4 @@
 path = "ecosystem::lsp"
 
 [dependencies]
-"ecosystem::rope" = "0.1.0"
+"ecosystem::rope" = true

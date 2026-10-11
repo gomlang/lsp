@@ -27,7 +27,7 @@ coverage of every optional LSP feature or generated protocol type.
 
 `examples/basic/` is a runnable server with hover, typed addition, echo and
 document-inspection handlers. Its black-box tests instantiate public APIs;
-`goml verify` also runs them against an isolated registry snapshot.
+the ecosystem verification runner also runs them against an isolated registry snapshot.
 
 ## Framing and messages
 
@@ -429,12 +429,11 @@ stdout. This is targeted protocol coverage, not full LSP certification.
 
 ## Development and examples
 
-Requires GoML 0.1.56 or newer. The `examples/basic/` example shares the root manifest. From the library root, run:
+Requires the source-built GoML toolchain with unversioned registry support pinned in [verification/ci/toolchain.json](https://github.com/gomlang/verification/blob/main/ci/toolchain.json). The `examples/basic/` example shares the root manifest. From the library root, run:
 
 ```sh
 goml run --example basic
 goml test
-goml verify --timeout 300s
 ```
 
-`goml test` builds the example and runs its tests. `goml verify` repeats the example checks as an independent module against an isolated registry snapshot. `(cd ../verification && just ecosystem-test lsp)` also retains the library-specific smoke and compatibility checks.
+`goml test` builds the example and runs its tests. `(cd ../verification && just ecosystem-test lsp)` also retains the library-specific smoke and compatibility checks.

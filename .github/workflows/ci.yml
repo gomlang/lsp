@@ -15,7 +15,7 @@ concurrency:
 
 jobs:
   verify:
-    uses: gomlang/verification/.github/workflows/ecosystem-ci.yml@ba4004841e2a28c407fbf4b0633d2df8dc3ad7c4
+    uses: gomlang/verification/.github/workflows/ecosystem-ci.yml@764b6971263156f54ca4a5ffdfe7bca0ee3057c1
     with:
       module: lsp
-      verification-ref: ba4004841e2a28c407fbf4b0633d2df8dc3ad7c4
+      verification-ref: 764b6971263156f54ca4a5ffdfe7bca0ee3057c1
