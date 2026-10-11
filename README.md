@@ -397,7 +397,7 @@ the application. Raw JSON handlers support their protocol messages.
 Run from this library repository:
 
 ```sh
-(cd ../verification && just ecosystem-test lsp)
+(cd ../workflows && just ecosystem-test lsp)
 ```
 
 The GoML tests cover every two-part split of a Unicode frame, single-byte chunks,
@@ -429,11 +429,11 @@ stdout. This is targeted protocol coverage, not full LSP certification.
 
 ## Development and examples
 
-Requires the source-built GoML toolchain with unversioned registry support pinned in [verification/ci/toolchain.json](https://github.com/gomlang/verification/blob/main/ci/toolchain.json). The `examples/basic/` example shares the root manifest. From the library root, run:
+Requires the source-built GoML toolchain with unversioned registry support pinned in [workflows/ci/toolchain.json](https://github.com/gomlang/workflows/blob/main/ci/toolchain.json). The `examples/basic/` example shares the root manifest. From the library root, run:
 
 ```sh
 goml run --example basic
 goml test
 ```
 
-`goml test` builds the example and runs its tests. `(cd ../verification && just ecosystem-test lsp)` also retains the library-specific smoke and compatibility checks.
+`goml test` builds the example and runs its tests. `(cd ../workflows && just ecosystem-test lsp)` also retains the library-specific smoke and compatibility checks.
